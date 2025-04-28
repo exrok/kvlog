@@ -1,4 +1,4 @@
-# KVLog | Fast Structual and Hierarchical binary logging for rust
+# KVLog | Fast Structural and Hierarchical binary logging for rust
 
 Example:
 

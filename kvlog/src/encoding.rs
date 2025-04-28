@@ -281,6 +281,11 @@ builtin_keys! {
     kind,
     sensor_id,
     handler,
+    timestamp,
+    elapsed,
+    camera_id,
+    system_id,
+    next
 }
 
 pub trait Encode {
