@@ -62,7 +62,7 @@ pub static LOG_WRITER: Mutex<LogQueue> = Mutex::new(LogQueue {
 const BUFFER_CAPACITY: usize = 4096;
 
 pub fn mini_time(out: &mut Vec<u8>, timestamp_nanos: u64) {
-    crate::Timestamp::raw_millisecond_iso_in_vec((timestamp_nanos / 1000) as i64, out);
+    crate::Timestamp::raw_millisecond_iso_in_vec((timestamp_nanos / 1000_000) as i64, out);
 }
 
 const SPAN_COLORS: &[&str] = &[

@@ -42,7 +42,7 @@ impl Timestamp {
             )
         };
         unsafe {
-            output.set_len(len);
+            output.set_len(output.len() + len);
         }
     }
     /// Appends the given timestamp in ISO 8601 format to the output
