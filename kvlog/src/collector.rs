@@ -1,8 +1,7 @@
 use std::alloc::Layout;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::{fs::File, io::IsTerminal};
 
@@ -10,7 +9,7 @@ use std::sync::{Condvar, Mutex};
 use std::thread;
 
 use crate::encoding::{now, Encoder, StaticKey};
-use crate::SpanID;
+use crate::{CollectorConfig, SpanID};
 
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum SyncState {
@@ -269,16 +268,19 @@ fn stdout_sync_thread() {
         }
     }
 }
+
+const INIT_MAGIC: u64 = 0xF745_119Eu64 << 32;
 const MAGIC: u64 = 0x8910_FC0Eu64 << 32;
-const DEFAULT_COLLECTOR_SOCKET_PATH: &str = "/tmp/.kvlog_collector.sock";
+pub const DEFAULT_COLLECTOR_SOCKET_PATH: &str = "/tmp/.kvlog_collector.sock";
 
 pub struct SmartCollector {
-    current_socket_created_at: Option<SystemTime>,
+    current_socket_modified_at: Option<SystemTime>,
     last_polled: std::time::Instant,
     fmtbuf: Vec<u8>,
-    socket_path: String,
+    socket_path: PathBuf,
     stream: Option<UnixStream>,
     parents: Box<ParentSpanSuffixCache>,
+    service_name: String,
 }
 fn attach_prelude(buffer: &mut [u8]) -> &[u8] {
     if buffer.len() < 9 {
@@ -290,15 +292,15 @@ fn attach_prelude(buffer: &mut [u8]) -> &[u8] {
 }
 
 impl SmartCollector {
-    fn new() -> SmartCollector {
+    fn new(socket_path: PathBuf, service_name: String) -> SmartCollector {
         let mut collector = SmartCollector {
-            current_socket_created_at: None,
+            current_socket_modified_at: None,
             last_polled: std::time::Instant::now(),
             fmtbuf: Vec::new(),
-            socket_path: std::env::var("KVLOG_COLLECTOR_SOCKET")
-                .unwrap_or_else(|_| DEFAULT_COLLECTOR_SOCKET_PATH.into()),
+            socket_path,
             stream: None,
             parents: ParentSpanSuffixCache::new_boxed(),
+            service_name,
         };
         collector.try_connect_stream(Duration::ZERO);
         collector
@@ -311,26 +313,59 @@ impl SmartCollector {
                 return None;
             }
             self.last_polled = now;
-            let metadata = std::fs::metadata(&self.socket_path).ok()?;
-            let created_at = metadata.created().ok()?;
-            if Some(created_at) == self.current_socket_created_at {
-                return None;
+            let metadata = match std::fs::metadata(&self.socket_path) {
+                Ok(metadata) => metadata,
+                Err(_err) => {
+                    return None;
+                }
+            };
+            // best effort optimization to avoid trying re-connect which is more
+            // expansive then a stat call.
+            if let Some(modified_at) = metadata.modified().ok() {
+                if Some(modified_at) == self.current_socket_modified_at {
+                    return None;
+                }
+                self.current_socket_modified_at = Some(modified_at);
             }
-            self.current_socket_created_at = Some(created_at);
-            self.stream = UnixStream::connect(&self.socket_path).ok();
+            self.stream = match UnixStream::connect(&self.socket_path) {
+                Ok(mut stream) => {
+                    if !self.service_name.is_empty() {
+                        let buflen = self.fmtbuf.len();
+                        //todo guard against huge service name
+                        let prefix = INIT_MAGIC | ((self.service_name.len() as u64) & 0xffff_ffff);
+                        self.fmtbuf.extend_from_slice(&u64::to_le_bytes(prefix));
+                        self.fmtbuf.extend_from_slice(self.service_name.as_bytes());
+                        let res = stream.write_all(&self.fmtbuf[buflen..]);
+                        self.fmtbuf.truncate(buflen);
+                        if res.is_err() {
+                            return None;
+                        }
+                    }
+
+                    Some(stream)
+                }
+                Err(_err) => None,
+            }
         }
         self.stream.as_mut()
     }
     fn output(&mut self, buffer: &mut [u8]) {
         if let Some(stream) = self.try_connect_stream(Duration::from_millis(500)) {
-            //todo something with the error
             if let Err(err) = stream.write_all(attach_prelude(buffer)) {
                 use crate as kvlog;
-                crate::warn!(
-                    "KVLog collector connection closed",
-                    %err,
-                    socket = self.socket_path
-                );
+                {
+                    use kvlog::encoding::Encode;
+                    let mut log = kvlog::global_logger();
+                    let mut fields = log.encoder.append_now(kvlog::LogLevel::Warn);
+                    fields.raw_key(1).value_via_display(&err);
+                    fields
+                        .dynamic_key("socket")
+                        .value_via_debug(&self.socket_path);
+                    (module_path!()).encode_log_value_into(fields.raw_key(15));
+                    ("KVLog collector connection closed").encode_log_value_into(fields.raw_key(0));
+                    fields.apply_current_span();
+                    log.poke();
+                };
                 self.stream = None;
             } else {
                 return;
@@ -341,7 +376,7 @@ impl SmartCollector {
     }
 }
 
-fn hybrid_local_thread() {
+pub(crate) fn hybrid_local_thread(socket: PathBuf, service_name: String) {
     let mut max_size: usize = 0;
     let mut buffer = Vec::<u8>::with_capacity(BUFFER_CAPACITY);
     buffer.extend_from_slice(&MAGIC.to_le_bytes());
@@ -355,7 +390,7 @@ fn hybrid_local_thread() {
             queue.encoder.buffer.splice(0..0, MAGIC.to_le_bytes());
         }
     }
-    let mut stream = SmartCollector::new();
+    let mut stream = SmartCollector::new(socket, service_name);
     loop {
         let mut queue = LOG_WRITER.lock().unwrap();
         if queue.sync_state == SyncState::Flushing {
@@ -458,15 +493,16 @@ impl Drop for LoggerGuard {
 }
 const LOG_FILE_TARGET_SIZE: usize = 1024 * 1024 * 16; // 16 MB
 
-fn directory_sync_thread(path: Box<str>) {
-    let mut pathbuf = PathBuf::from_str(&path).expect("XLOG invalid PATH");
+fn directory_sync_thread(pathbuf: PathBuf) {
+    let path = pathbuf.to_string_lossy().into_owned();
+    let mut pathbuf = pathbuf;
     if let Err(err) = std::fs::create_dir_all(&pathbuf) {
-        panic!("XLOG: {} {:?}", path, err);
+        panic!("kvlog: {} {:?}", path, err);
     }
     let active_path = pathbuf.join("active");
     pathbuf.push(&"archive");
     if let Err(err) = std::fs::create_dir_all(&pathbuf) {
-        panic!("XLOG: {} {:?}", path, err);
+        panic!("kvlog: {} {:?}", path, err);
     }
     let (mut written, mut file) = if let Ok(meta) = std::fs::metadata(&active_path) {
         (
@@ -474,12 +510,12 @@ fn directory_sync_thread(path: Box<str>) {
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&active_path)
-                .expect("XLOG SYNC THREAD: failed to open log1"),
+                .expect("kvlog SYNC THREAD: failed to open log"),
         )
     } else {
         (
             0,
-            File::create(&active_path).expect("XLOG SYNC THREAD: failed to open log"),
+            File::create(&active_path).expect("kvlog SYNC THREAD: failed to open log"),
         )
     };
     let mut max_size: usize = 0;
@@ -489,7 +525,7 @@ fn directory_sync_thread(path: Box<str>) {
             pathbuf.push(&format!("{:?}.bin", now()));
             let _ = std::fs::rename(&active_path, &pathbuf);
             pathbuf.pop();
-            file = File::create(&active_path).expect("XLOG SYNC THREAD: failed to open log");
+            file = File::create(&active_path).expect("kvlog SYNC THREAD: failed to open log");
             written = 0;
         }
 
@@ -581,7 +617,7 @@ pub fn init_file_logger(file: &str) -> LoggerGuard {
 /// to the specified directory.
 #[must_use]
 pub fn init_directory_logger(dir: &str) -> LoggerGuard {
-    let dir: Box<str> = dir.into();
+    let dir: PathBuf = Path::new(dir).into();
     init_logger(move || directory_sync_thread(dir))
 }
 
@@ -589,11 +625,32 @@ pub fn init_directory_logger(dir: &str) -> LoggerGuard {
 /// to the specified directory.
 #[must_use]
 pub fn init_smart_logger() -> LoggerGuard {
-    init_logger(move || hybrid_local_thread())
+    init_logger(|| hybrid_local_thread(DEFAULT_COLLECTOR_SOCKET_PATH.into(), "".into()))
 }
 
 fn init_logger(syncfn: impl FnOnce() + Send + 'static) -> LoggerGuard {
     let _ = SpanID::next();
     LOG_WRITER.lock().unwrap().handle = Some(std::thread::spawn(syncfn));
     LoggerGuard {}
+}
+impl CollectorConfig {
+    pub fn spawn(self) -> LoggerGuard {
+        match self {
+            CollectorConfig::Stdout => init_stdout_logger(),
+            CollectorConfig::Directory { path } => init_logger(move || directory_sync_thread(path)),
+            CollectorConfig::SingleFile { path } => init_logger(move || {
+                file_sync_thread(
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&path)
+                        .expect("FAILED to open log file"),
+                )
+            }),
+            CollectorConfig::SocketOrStdout {
+                service_name,
+                socket,
+            } => init_logger(move || hybrid_local_thread(socket, service_name)),
+        }
+    }
 }

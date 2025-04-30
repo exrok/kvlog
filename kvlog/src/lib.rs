@@ -2,13 +2,14 @@ use std::{
     cell::Cell,
     mem::ManuallyDrop,
     num::NonZeroU64,
+    path::PathBuf,
+    str::FromStr,
     sync::{atomic::AtomicU64, MutexGuard},
 };
 
-use collector::LogQueue;
+use collector::{LogQueue, LoggerGuard};
 pub use encoding::BStr;
 pub use encoding::{Encode, SpanInfo, ValueEncoder};
-pub use kvlog_macros::emit_log;
 mod spanning;
 mod timestamp;
 pub use spanning::Spanning;
@@ -26,22 +27,16 @@ impl Timer {
     }
 }
 
-#[macro_export]
-macro_rules! info { ($($tt:tt)*) => { $crate::emit_log!(Info, $($tt)*) }; }
-#[macro_export]
-macro_rules! warn { ($($tt:tt)*) => { $crate::emit_log!(Warn, $($tt)*) }; }
-#[macro_export]
-macro_rules! trace { ($($tt:tt)*) => { $crate::emit_log!(Trace, $($tt)*) }; }
+pub use kvlog_macros::{error, info, warn};
+
 #[cfg(feature = "debug")]
 #[macro_export]
-macro_rules! debug { ($($tt:tt)*) => { $crate::emit_log!(Debug, $($tt)*) }; }
+pub use kvlog_macros::debug;
 #[cfg(not(feature = "debug"))]
 #[macro_export]
 macro_rules! debug {
     ($($tt:tt)*) => {};
 }
-#[macro_export]
-macro_rules! error { ($($tt:tt)*) => { $crate::emit_log!(Error, $($tt)*) }; }
 
 thread_local! {
     static CURRENT_SPAN_ID: Cell<u64> = const { Cell::new(0) };
@@ -189,3 +184,223 @@ impl LogLevel {
 
 pub mod collector;
 pub mod encoding;
+
+impl CollectorConfig {
+    pub fn with_service_name(self, name: &str) -> Self {
+        match self {
+            CollectorConfig::SocketOrStdout { socket, .. } => CollectorConfig::SocketOrStdout {
+                service_name: name.to_string(),
+                socket,
+            },
+            _ => self,
+        }
+    }
+}
+
+/// Spawn background log collector thread with configuration from the env var:
+///     `KVLOG_COLLECTOR_CONFIG`
+/// Using [CollectorConfig::default()] if the env var can't be read. If quiet
+/// is not set to true, the selected logging configuration will be printed to
+/// stdout.
+///
+/// See [CollectorConfig] for details on the configuration.
+///
+/// Note: When the `LoggerGuard` returned from this function is dropped
+/// the spawned collector will be flushed and terminated.
+///
+/// # Example:
+/// ```
+/// let _guard = kvlog::spawn_collector_from_env(Some("ServiceName"), false);
+/// kvlog::info!("Hello World");
+/// ```
+#[must_use]
+pub fn spawn_collector_from_env(service_name: Option<&str>, quiet: bool) -> LoggerGuard {
+    let (mut collector, printstmt) = if let Ok(value) = std::env::var("KVLOG_COLLECTOR_CONFIG") {
+        match value.parse::<CollectorConfig>() {
+            Ok(value) => (
+                value,
+                "configuration from the KVLOG_COLLECTOR_CONFIG environment variable",
+            ),
+            Err(err) => {
+                if !quiet {
+                    println!("KVLOG: Error parsing KVLOG_COLLECTOR_CONFIG environment variable\n value: `{}`\n error: {}", value, err);
+                }
+                (
+                    CollectorConfig::default(),
+                    "default configuration after an error parsing",
+                )
+            }
+        }
+    } else {
+        (
+            CollectorConfig::default(),
+            "default configuration (KVLOG_COLLECTOR_CONFIG not set)",
+        )
+    };
+    if let Some(service_name) = service_name {
+        collector = collector.with_service_name(service_name);
+    }
+
+    if !quiet {
+        println!("KVLOG: Using the {printstmt}: {:#?}", collector)
+    }
+    collector.spawn()
+}
+
+impl std::default::Default for CollectorConfig {
+    fn default() -> Self {
+        CollectorConfig::SocketOrStdout {
+            service_name: String::new(),
+            socket: collector::DEFAULT_COLLECTOR_SOCKET_PATH.into(),
+        }
+    }
+}
+
+/// Configuration for how log messages should be collected.
+///
+/// This enum specifies the destination for log output. It implements the
+/// `FromStr` trait, allowing it to be parsed from a string representation.
+///
+/// # String Format
+///
+/// The expected string format is: `[SERVICE_NAME@]KIND[:PATH]`
+///
+/// - `KIND`: (Required) Specifies the collection method. Must be one of:
+///   - `Stdout`: Log to standard output.
+///   - `Directory`: Log to files within a specified directory.
+///   - `SingleFile`: Log to a single specified file.
+///   - `SocketOrStdout`: Log to a Unix domain socket, falling back to standard output.
+/// - `PATH`: (Optional, separated by `:`) The file system path for relevant kinds.
+///   - *Required* and must not be empty for `Directory` and `SingleFile`.
+///   - *Optional* for `SocketOrStdout`. If omitted or empty, it defaults to
+///     `collector::DEFAULT_COLLECTOR_SOCKET_PATH`.
+///   - Ignored for `Stdout`.
+/// - `SERVICE_NAME`: (Optional, separated by `@`) A name for the service, used only
+///   by `SocketOrStdout`. If omitted, it defaults to an empty string.
+///
+/// # Examples of String Parsing
+///
+/// - `"Stdout"` parses to `CollectorConfig::Stdout`
+/// - `"Directory:/var/log/my_app"` parses to `CollectorConfig::Directory { path: "/var/log/my_app".into() }`
+/// - `"SingleFile:/tmp/app.log"` parses to `CollectorConfig::SingleFile { path: "/tmp/app.log".into() }`
+/// - `"service1@SocketOrStdout:/tmp/service1.sock"` parses to `CollectorConfig::SocketOrStdout { service_name: "service1".into(), socket: "/tmp/service1.sock".into() }`
+/// - `"SocketOrStdout"` parses to `CollectorConfig::SocketOrStdout { service_name: "".into(), socket: collector::DEFAULT_COLLECTOR_SOCKET_PATH.into() }` // Using default path and empty service name
+/// - `"service2@SocketOrStdout"` parses to `CollectorConfig::SocketOrStdout { service_name: "service2".into(), socket: collector::DEFAULT_COLLECTOR_SOCKET_PATH.into() }` // Using default path
+///
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub enum CollectorConfig {
+    /// Log messages are written directly to standard output (stdout).
+    Stdout,
+    /// Log messages are written to timestamped files within the specified directory.
+    /// The `path` must be provided when parsing from a string.
+    Directory { path: PathBuf },
+    /// All log messages are written to the single specified file.
+    /// The `path` must be provided when parsing from a string.
+    SingleFile { path: PathBuf },
+    /// Log messages are sent over a Unix domain socket specified by `socket`.
+    /// If the socket connection fails or is unavailable, logs fall back to standard output.
+    /// The `service_name` is used for identification purposes with the collector service.
+    /// When parsing from a string, `service_name` is optional (defaults to empty)
+    /// and `socket` path is optional (defaults to `collector::DEFAULT_COLLECTOR_SOCKET_PATH`).
+    SocketOrStdout {
+        service_name: String,
+        socket: PathBuf,
+    },
+}
+
+impl FromStr for CollectorConfig {
+    type Err = &'static str;
+
+    fn from_str(mut input: &str) -> Result<Self, Self::Err> {
+        let service_name = if let Some((service_name, rest)) = input.split_once('@') {
+            input = rest;
+            Some(service_name)
+        } else {
+            None
+        };
+        let (kind, path) = input.split_once(':').unwrap_or((input, ""));
+        match kind {
+            "Stdout" => Ok(CollectorConfig::Stdout),
+            "Directory" => {
+                if path.is_empty() {
+                    Err("Directory path is required and must not be empty")
+                } else {
+                    Ok(CollectorConfig::Directory {
+                        path: PathBuf::from(path),
+                    })
+                }
+            }
+            "SingleFile" => {
+                if path.is_empty() {
+                    Err("SingleFile path is required and must not be empty")
+                } else {
+                    Ok(CollectorConfig::SingleFile {
+                        path: PathBuf::from(path),
+                    })
+                }
+            }
+            "SocketOrStdout" => Ok(CollectorConfig::SocketOrStdout {
+                service_name: service_name.unwrap_or_default().into(),
+                socket: if path.is_empty() {
+                    collector::DEFAULT_COLLECTOR_SOCKET_PATH.into()
+                } else {
+                    path.into()
+                },
+            }),
+            _ => Err("Invalid collector type"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn parse_collector_config() {
+        assert_eq!(
+            CollectorConfig::SingleFile {
+                path: "/tmp/output.log".into()
+            },
+            "SingleFile:/tmp/output.log".parse().unwrap(),
+        );
+        assert_eq!(
+            CollectorConfig::Directory {
+                path: "/tmp/logs/".into()
+            },
+            "Directory:/tmp/logs/".parse().unwrap(),
+        );
+        assert!("SingleFile:".parse::<CollectorConfig>().is_err());
+        assert!("SingleFile".parse::<CollectorConfig>().is_err());
+        assert!("Directory:".parse::<CollectorConfig>().is_err());
+        assert!("Directory".parse::<CollectorConfig>().is_err());
+        assert_eq!(CollectorConfig::Stdout, "Stdout".parse().unwrap(),);
+
+        assert!("SocketOrStdout:".parse::<CollectorConfig>().is_ok());
+        assert!("SocketOrStdout".parse::<CollectorConfig>().is_ok());
+
+        assert_eq!(
+            CollectorConfig::SocketOrStdout {
+                service_name: String::new(),
+                socket: collector::DEFAULT_COLLECTOR_SOCKET_PATH.into()
+            },
+            "SocketOrStdout".parse().unwrap(),
+        );
+
+        assert_eq!(
+            CollectorConfig::SocketOrStdout {
+                service_name: "aname".to_string(),
+                socket: collector::DEFAULT_COLLECTOR_SOCKET_PATH.into()
+            },
+            "aname@SocketOrStdout".parse().unwrap(),
+        );
+        assert_eq!(
+            CollectorConfig::SocketOrStdout {
+                service_name: "another_name".to_string(),
+                socket: "/tmp/my.kvlog.sock".into()
+            },
+            "another_name@SocketOrStdout:/tmp/my.kvlog.sock"
+                .parse()
+                .unwrap(),
+        );
+    }
+}

@@ -181,7 +181,7 @@ fn munch_expr(input: &mut IntoIter, output: &mut Vec<TokenTree>) -> ExprKind {
 }
 
 impl Codegen {
-    fn new(toks: &mut IntoIter, builder: Ident) -> Codegen {
+    fn new(level: &str, builder: Ident) -> Codegen {
         let mut codegen = Codegen {
             out: TokenStream::new(),
             collect: Vec::with_capacity(64),
@@ -190,22 +190,7 @@ impl Codegen {
             message: None,
             span: SpanAttributes::default(),
         };
-        let log_level = if let Some(tok) = toks.next() {
-            if let TokenTree::Ident(ident) = tok {
-                TokenTree::Ident(ident)
-            } else {
-                codegen.error(tok.span(), "Expected Log Level".into());
-                TokenTree::Ident(Ident::new("Info", tok.span()))
-            }
-        } else {
-            codegen.error(Span::call_site(), "Missing Log Level".into());
-            return codegen;
-        };
-        if let Some(comma) = toks.next() {
-            if !is_char(&comma, ',') {
-                codegen.error(comma.span(), "Expected Comma after log level".into());
-            }
-        }
+        let log_level = TokenTree::Ident(Ident::new(level, Span::call_site()));
         codegen.out.extend(toks![
             use kvlog%:encoding%:Encode;
             let mut log = kvlog%:global_logger();
@@ -528,10 +513,29 @@ impl Codegen {
     }
 }
 
-#[proc_macro]
-pub fn emit_log(input: TokenStream) -> TokenStream {
-    let mut toks = input.into_iter();
-    let mut codegen = Codegen::new(&mut toks, Ident::new("fields", Span::call_site()));
+fn emit_log(input: TokenStream, level: &str) -> TokenStream {
+    let toks = input.into_iter();
+    let mut codegen = Codegen::new(level, Ident::new("fields", Span::call_site()));
     codegen.parse_values(toks);
     codegen.finish_creating()
+}
+
+#[proc_macro]
+pub fn info(input: TokenStream) -> TokenStream {
+    emit_log(input, "Info")
+}
+
+#[proc_macro]
+pub fn debug(input: TokenStream) -> TokenStream {
+    emit_log(input, "Debug")
+}
+
+#[proc_macro]
+pub fn error(input: TokenStream) -> TokenStream {
+    emit_log(input, "Error")
+}
+
+#[proc_macro]
+pub fn warn(input: TokenStream) -> TokenStream {
+    emit_log(input, "Warn")
 }
