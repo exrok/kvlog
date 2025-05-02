@@ -1,0 +1,25 @@
+[package]
+name = "kvlog-index"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+# debug = true
+# lto = "fat"
+# codegen-units = 1
+# panic = "abort"
+
+
+[dependencies]
+ahash = "0.8.10"
+atomic-wait = "1.1.0"
+hashbrown = "0.14.3"
+kvlog = "0.1"
+libc = "0.2.153"
+smallvec = { version = "1.13.1", features = ["union"] }
+uuid = "1.7.0"
+ra-ap-rustc_lexer = "0.44"
+beef = "0.5.2"
+memchr = "2.7.1"
+oorandom = "11.1.3"
+mio = { version = "1", features = ["os-poll", "net"] }
