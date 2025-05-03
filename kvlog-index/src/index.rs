@@ -1098,6 +1098,7 @@ impl IndexReader {
             current_offset: 0,
             strategy: QueryStrategy::Simple,
             buffer: Vec::new(),
+            frozen: false,
         };
         walker
     }
@@ -1197,28 +1198,28 @@ impl InternedRange {
 #[derive(Debug)]
 pub struct BucketMemoryStats {
     pub log_count: usize,
-    pub interned: usize,
-    pub log_metadata: usize,
-    pub fields: usize,
+    pub total_fields: usize,
     pub custom_keys: usize,
-    pub span: usize,
-    pub general_map: usize,
-    pub uuid_map: usize,
-    pub messages: usize,
+    pub log_metadata_bytes: usize,
+    pub span_bytes: usize,
+    pub message_bytes: usize,
+    pub interned_bytes: usize,
+    pub general_map_bytes: usize,
+    pub uuid_map_bytes: usize,
 }
 impl BucketMemoryStats {
     pub fn bytes_per_log(&self) -> f64 {
         (self.total() as f64) / self.log_count as f64
     }
     pub fn total(&self) -> usize {
-        self.interned
-            + self.log_metadata
-            + self.fields
-            + self.span
+        self.interned_bytes
+            + self.log_metadata_bytes
+            + self.total_fields
+            + self.span_bytes
             + self.custom_keys
-            + self.general_map
-            + self.uuid_map
-            + self.messages
+            + self.general_map_bytes
+            + self.uuid_map_bytes
+            + self.message_bytes
     }
 }
 
@@ -1249,6 +1250,9 @@ unsafe impl Send for Index {}
 pub const _: *const () = &Index::write::<'static, LogFields<'static>> as *const _ as _;
 // Static keys are a maxium 127,
 impl Index {
+    pub fn generation(&self) -> usize {
+        self.generation
+    }
     pub fn reader(&self) -> &Arc<IndexReader> {
         &self.reader
     }
@@ -1342,7 +1346,7 @@ impl Index {
             + std::mem::size_of::<u32>() //offset
             + std::mem::size_of::<u16>() //target
             + std::mem::size_of::<u16>()
-                //msg
+                //archetype
             );
         let field_bytes = self.fields_used * std::mem::size_of::<Field>();
         let custom_key_bytes = (self.custom_keys as usize) * std::mem::size_of::<InternedRange>();
@@ -1350,18 +1354,18 @@ impl Index {
         let intern_map_bytes =
             ((self.general_intern_map.len() * std::mem::size_of::<InternedRange>()) * 8) / 7;
         let uuid_map_bytes = ((self.general_intern_map.len() * std::mem::size_of::<u32>()) * 8) / 7;
-        let message_bytes = self.msg_map.len() * std::mem::size_of::<InternedRange>();
+        let message_map_bytes = self.msg_map.len() * std::mem::size_of::<InternedRange>();
 
         BucketMemoryStats {
             log_count: self.logs_used,
-            interned: interned_bytes,
-            log_metadata: per_log_bytes,
-            fields: field_bytes,
+            interned_bytes,
+            log_metadata_bytes: per_log_bytes,
+            total_fields: field_bytes,
             custom_keys: custom_key_bytes,
-            span: span_bytes,
-            messages: message_bytes,
-            general_map: intern_map_bytes,
-            uuid_map: uuid_map_bytes,
+            span_bytes,
+            message_bytes: message_map_bytes,
+            general_map_bytes: intern_map_bytes,
+            uuid_map_bytes,
         }
     }
     pub fn new() -> Index {

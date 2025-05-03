@@ -31,7 +31,6 @@ impl TargetLevelFilter {
             };
             *collect = (*set as u8) & 0b1111;
         }
-        println!("{max} {default} {:?} -> {:?}", pairs, mask);
         TargetLevelFilter { mask }
     }
     pub fn matches_archtype(&self, entry: &Archetype) -> bool {
@@ -448,8 +447,6 @@ impl<'a> ForwardQueryWalker<'a> {
                 return None;
             }
         };
-
-        println!("Using query strategy: {}", self.strategy.name());
         match &self.strategy {
             QueryStrategy::Empty => {
                 let mut entries: Vec<u32> = Vec::new();
@@ -507,6 +504,7 @@ pub struct ReverseQueryWalker<'a> {
     pub(crate) current_offset: u32,
     pub(crate) strategy: QueryStrategy,
     pub(crate) buffer: Vec<u32>,
+    pub(crate) frozen: bool,
 }
 
 #[derive(Default)]
@@ -749,6 +747,13 @@ impl<'a> ReverseQueryWalker<'a> {
     fn specialize(&mut self, bucket: &BucketGuard<'a>) {
         self.strategy = specialize_with_archetype_index(bucket, &self.general_filter);
     }
+    pub fn release_bucket_reclamation_lock(&mut self) {
+        if let Some(bucket) = self.current_bucket.take() {
+            self.next_generation = bucket.bucket.generation.load(Ordering::Relaxed);
+            self.frozen = true;
+        }
+    }
+
     fn load_bucket(&mut self) -> bool {
         if let Some(bucket) = &self.current_bucket {
             if self.time_range.min_utc_ns != 0 {
@@ -766,7 +771,12 @@ impl<'a> ReverseQueryWalker<'a> {
                 if new_bucket.bucket.generation.load(Ordering::Relaxed) != self.next_generation {
                     return false;
                 }
-                self.current_offset = new_bucket.len as u32;
+                if self.frozen {
+                    self.current_offset = (new_bucket.len as u32).min(self.current_offset);
+                    self.frozen = false;
+                } else {
+                    self.current_offset = new_bucket.len as u32;
+                }
                 if self.time_range.min_utc_ns != 0 {
                     self.current_offset = new_bucket
                         .reverse_time_range_skip(self.current_offset, self.time_range.clone());
