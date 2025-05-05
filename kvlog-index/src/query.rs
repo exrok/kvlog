@@ -1,6 +1,5 @@
 use kvlog::encoding::{Key, Value};
 use kvlog::LogLevel;
-use ra_ap_rustc_lexer::TokenKind as Tok;
 use std::fs;
 use std::hash::Hasher;
 use std::io;
@@ -8,7 +7,10 @@ use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
 use std::{borrow::Cow, fmt::write};
+// mod query_parts;
 
+// mod ai;
+use ra_ap_rustc_lexer::TokenKind as Tok;
 use ra_ap_rustc_lexer::{Cursor, LiteralKind};
 
 enum SimplePredicate {
@@ -45,14 +47,10 @@ impl QueryExpr {
         while let Some((key, predicate)) = munch(&mut ts)? {
             fields.push((key.into(), predicate));
         }
-        Ok(QueryExpr {
-            simple: PredicateSet::default(),
-            fields,
-        })
+        Ok(QueryExpr { simple: PredicateSet::default(), fields })
     }
 }
 
-// fields must be [a-zA-Z0-9_]*
 // white space is ignored
 // quotes around strings are optional unless they contain char outside '-_a-zA-Z0-9.'
 #[derive(PartialEq, Clone)]
@@ -130,16 +128,8 @@ impl std::fmt::Debug for FieldPredicate {
             Self::IsI64(arg0) => f.debug_tuple("IsI64").field(arg0).finish(),
             Self::IsU64(arg0) => f.debug_tuple("IsU64").field(arg0).finish(),
             Self::IsBool(arg0) => f.debug_tuple("IsBool").field(arg0).finish(),
-            Self::RangeNum { min, max } => f
-                .debug_struct("RangeNum")
-                .field("min", min)
-                .field("max", max)
-                .finish(),
-            Self::RangeFloat { min, max } => f
-                .debug_struct("RangeFloat")
-                .field("min", min)
-                .field("max", max)
-                .finish(),
+            Self::RangeNum { min, max } => f.debug_struct("RangeNum").field("min", min).field("max", max).finish(),
+            Self::RangeFloat { min, max } => f.debug_struct("RangeFloat").field("min", min).field("max", max).finish(),
             Self::Exists => f.write_str("Exists"),
             Self::NotExists => f.write_str("NotExists"),
         }
@@ -161,24 +151,15 @@ fn extra_str_literal<'a>(raw: &'a str, kind: LiteralKind) -> Option<Str<'a>> {
         LiteralKind::ByteStr { .. } => (Mode::ByteStr, raw.get(2..raw.len() - 1)?),
         LiteralKind::RawStr { n_hashes } => {
             let n_hashes = n_hashes.unwrap_or(0);
-            (
-                Mode::RawStr,
-                raw.get(2 + n_hashes as usize..raw.len() - n_hashes as usize - 1)?,
-            )
+            (Mode::RawStr, raw.get(2 + n_hashes as usize..raw.len() - n_hashes as usize - 1)?)
         }
         LiteralKind::RawByteStr { n_hashes } => {
             let n_hashes = n_hashes.unwrap_or(0);
-            (
-                Mode::RawByteStr,
-                raw.get(3 + n_hashes as usize..raw.len() - n_hashes as usize - 1)?,
-            )
+            (Mode::RawByteStr, raw.get(3 + n_hashes as usize..raw.len() - n_hashes as usize - 1)?)
         }
         LiteralKind::RawCStr { n_hashes } => {
             let n_hashes = n_hashes.unwrap_or(0);
-            (
-                Mode::RawCStr,
-                raw.get(2 + n_hashes as usize..raw.len() - n_hashes as usize - 1)?,
-            )
+            (Mode::RawCStr, raw.get(2 + n_hashes as usize..raw.len() - n_hashes as usize - 1)?)
         }
         _ => {
             return None;
@@ -272,6 +253,7 @@ pub enum ParseError {
     UnexpectedEof,
     InvalidValue,
     Expected(Tok),
+    ExpectedLiteral,
     Unknown,
     UnknownMethod(Box<str>),
 }
@@ -281,12 +263,7 @@ impl<'a> TokenStream<'a> {
         &self.text[span.start as usize..span.end as usize]
     }
     fn new(content: &'a str) -> TokenStream<'a> {
-        return TokenStream {
-            text: content,
-            cursor: Cursor::new(content),
-            depth: 0,
-            offset: 0,
-        };
+        return TokenStream { text: content, cursor: Cursor::new(content), depth: 0, offset: 0 };
     }
     fn expect(&mut self, kind: Tok) -> Result<Token, ParseError> {
         let next = self.next();
@@ -321,13 +298,7 @@ impl<'a> TokenStream<'a> {
                 }
                 _ => (),
             }
-            return Token {
-                kind: tok.kind,
-                span: Span {
-                    start,
-                    end: self.offset,
-                },
-            };
+            return Token { kind: tok.kind, span: Span { start, end: self.offset } };
         }
     }
     fn expect_stringly_value(&mut self) -> Result<Box<[u8]>, ParseError> {
@@ -337,12 +308,11 @@ impl<'a> TokenStream<'a> {
                 return Ok(self[value.span].as_bytes().into());
             }
             Tok::Literal { kind, .. } => {
-                let value: Box<[u8]> =
-                    if let Some(value) = extra_str_literal(&self[value.span], kind) {
-                        value.as_bytes().into()
-                    } else {
-                        self[value.span].as_bytes().into()
-                    };
+                let value: Box<[u8]> = if let Some(value) = extra_str_literal(&self[value.span], kind) {
+                    value.as_bytes().into()
+                } else {
+                    self[value.span].as_bytes().into()
+                };
                 return Ok(value);
             }
             _ => return Err(ParseError::Unknown),
@@ -381,10 +351,7 @@ fn munch<'a>(ts: &mut TokenStream<'a>) -> Result<Option<(&'a str, FieldPredicate
                     return Ok(Some((ts.get(field.span), FieldPredicate::Contains(value))));
                 }
                 "starts_with" => {
-                    return Ok(Some((
-                        ts.get(field.span),
-                        FieldPredicate::StartsWith(value),
-                    )));
+                    return Ok(Some((ts.get(field.span), FieldPredicate::StartsWith(value))));
                 }
                 "ends_with" => {
                     return Ok(Some((ts.get(field.span), FieldPredicate::EndsWith(value))));
@@ -397,13 +364,27 @@ fn munch<'a>(ts: &mut TokenStream<'a>) -> Result<Option<(&'a str, FieldPredicate
             ts.expect(Tok::Eq)?;
             let value = ts.expect_stringly_value()?;
             let text = std::str::from_utf8(&value).unwrap();
-            let num = text
-                .parse::<i64>()
-                .map_err(|_err| ParseError::InvalidValue)?;
+            let num = text.parse::<i64>().map_err(|_err| ParseError::InvalidValue)?;
             return Ok(Some((ts.get(field.span), FieldPredicate::IsI64(num))));
         }
         Tok::Eq => {
             let name = ts.get(field.span);
+            let value = ts.next();
+            let value: Box<[u8]> = match value.kind {
+                Tok::Literal { kind, suffix_start } => {
+                    if let Some(value) = extra_str_literal(&ts[value.span], kind) {
+                        value.as_bytes().into()
+                    } else {
+                        let bytes = ts[value.span].as_bytes();
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        let num = text.parse::<i64>().map_err(|_err| ParseError::InvalidValue)?;
+                        return Ok(Some((ts.get(field.span), FieldPredicate::IsI64(num))));
+                    }
+                }
+                _ => {
+                    return Err(ParseError::ExpectedLiteral);
+                }
+            };
             let value = ts.expect_stringly_value()?;
             if name.ends_with("id") {
                 if value.len() == 36 {
@@ -418,7 +399,7 @@ fn munch<'a>(ts: &mut TokenStream<'a>) -> Result<Option<(&'a str, FieldPredicate
 
             // string value equality probably.
         }
-        Tok::Eof => return Err(ParseError::UnexpectedEof),
+        Tok::Eof => return Ok(Some((ts.get(field.span), FieldPredicate::Exists))),
         _ => return Err(ParseError::Unknown),
     }
 }

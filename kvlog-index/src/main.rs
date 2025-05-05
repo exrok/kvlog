@@ -35,12 +35,7 @@ impl FieldGen {
             FieldGen::Func(func) => func(rng),
             FieldGen::U32(range) => Value::I64(rng.rand_range(range.clone()).into()),
             FieldGen::UUID => {
-                let raw = [
-                    rng.rand_u32(),
-                    rng.rand_u32(),
-                    rng.rand_u32(),
-                    rng.rand_u32(),
-                ];
+                let raw = [rng.rand_u32(), rng.rand_u32(), rng.rand_u32(), rng.rand_u32()];
                 unsafe { Value::UUID(uuid::Uuid::from_bytes(*raw.as_ptr().cast())) }
             }
         }
@@ -99,7 +94,15 @@ macro_rules! fielddef {
 use uuid::Uuid;
 use FieldGen::*;
 use Value::String as S;
+
+fn parse_check() {
+    for token in ra_ap_rustc_lexer::tokenize("234.234ms") {
+        println!("{:?}", token);
+    }
+}
 fn main() {
+    parse_check();
+    return;
     // println!("{:X}", interleave(0xff));
     // return;
     let mut index = Index::new();
@@ -213,11 +216,7 @@ fn main() {
                     timestamp,
                     http_request[0].level,
                     kvlog::SpanInfo::Start { span, parent: None },
-                    RandomFields {
-                        rng: rng.clone(),
-                        syndrome: &http_request[0],
-                        stage: 0,
-                    },
+                    RandomFields { rng: rng.clone(), syndrome: &http_request[0], stage: 0 },
                 )
                 .unwrap();
             for _ in 0..(rng.rand_u32() & 0b11) {
@@ -229,11 +228,7 @@ fn main() {
                         timestamp,
                         syndrome.level,
                         kvlog::SpanInfo::Current { span },
-                        RandomFields {
-                            rng: rng.clone(),
-                            syndrome,
-                            stage: 0,
-                        },
+                        RandomFields { rng: rng.clone(), syndrome, stage: 0 },
                     )
                     .unwrap();
             }
@@ -243,11 +238,7 @@ fn main() {
                     timestamp,
                     http_request[1].level,
                     kvlog::SpanInfo::End { span },
-                    RandomFields {
-                        rng: rng.clone(),
-                        syndrome: &http_request[1],
-                        stage: 0,
-                    },
+                    RandomFields { rng: rng.clone(), syndrome: &http_request[1], stage: 0 },
                 )
                 .unwrap();
             continue;
@@ -259,20 +250,12 @@ fn main() {
                 timestamp,
                 syndrome.level,
                 kvlog::SpanInfo::None,
-                RandomFields {
-                    rng: rng.clone(),
-                    syndrome,
-                    stage: 0,
-                },
+                RandomFields { rng: rng.clone(), syndrome, stage: 0 },
             )
             .unwrap();
     }
     let elapsed = start.elapsed();
-    println!(
-        "Insertion: {:?}, {:?} / 1000 logs",
-        elapsed,
-        elapsed / ((logs / 1000) as u32)
-    );
+    println!("Insertion: {:?}, {:?} / 1000 logs", elapsed, elapsed / ((logs / 1000) as u32));
 
     let query_start = std::time::Instant::now();
     let mut string = String::with_capacity(512);
