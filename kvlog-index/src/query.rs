@@ -1,5 +1,7 @@
 use kvlog::encoding::{Key, Value};
 use kvlog::LogLevel;
+use ra_ap_rustc_lexer::TokenKind as Tok;
+use ra_ap_rustc_lexer::{Cursor, LiteralKind};
 use std::fs;
 use std::hash::Hasher;
 use std::io;
@@ -7,11 +9,9 @@ use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
 use std::{borrow::Cow, fmt::write};
-// mod query_parts;
 
+// mod query_parts;
 // mod ai;
-use ra_ap_rustc_lexer::TokenKind as Tok;
-use ra_ap_rustc_lexer::{Cursor, LiteralKind};
 
 enum SimplePredicate {
     Debug,
@@ -385,16 +385,6 @@ fn munch<'a>(ts: &mut TokenStream<'a>) -> Result<Option<(&'a str, FieldPredicate
                     return Err(ParseError::ExpectedLiteral);
                 }
             };
-            let value = ts.expect_stringly_value()?;
-            if name.ends_with("id") {
-                if value.len() == 36 {
-                    if let Ok(value) = std::str::from_utf8(&value) {
-                        if let Ok(id) = uuid::Uuid::from_str(value) {
-                            return Ok(Some((name, FieldPredicate::EqUUID(id))));
-                        }
-                    }
-                }
-            }
             return Ok(Some((name, FieldPredicate::Eq(value))));
 
             // string value equality probably.
