@@ -11,22 +11,13 @@ fn forward_query_continuations() {
     assert!(forward_query.next().is_none());
 
     let mut writer = TestIndexWriter::new(&mut index);
-    crate::log!(writer Info; msg="Hello");
+    crate::log!(writer; msg="Hello");
 
     assert!(forward_query.next().is_some());
     assert!(forward_query.next().is_none());
-    crate::log!(writer Info; msg="ABC");
-    assert_eq!(
-        forward_query
-            .next()
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .message(),
-        b"ABC"
-    );
-    crate::log!(writer Info; msg="Nice");
+    crate::log!(writer; msg="ABC");
+    assert_eq!(forward_query.next().unwrap().into_iter().next().unwrap().message(), b"ABC");
+    crate::log!(writer; msg="Nice");
 
     assert!(forward_query.next().is_some());
     assert!(forward_query.next().is_none());

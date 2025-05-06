@@ -13,9 +13,7 @@ pub struct KeyMap<T> {
 
 impl<T> Default for KeyMap<T> {
     fn default() -> Self {
-        Self {
-            data: Default::default(),
-        }
+        Self { data: Default::default() }
     }
 }
 
@@ -24,16 +22,10 @@ impl<T> KeyMap<T> {
         self.data.iter()
     }
     pub fn iter(&self) -> impl Iterator<Item = (KeyID, &T)> + '_ {
-        self.data
-            .iter()
-            .enumerate()
-            .map(|(raw, value)| (unsafe { KeyID::new(raw as u16) }, value))
+        self.data.iter().enumerate().map(|(raw, value)| (unsafe { KeyID::new(raw as u16) }, value))
     }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (KeyID, &mut T)> + '_ {
-        self.data
-            .iter_mut()
-            .enumerate()
-            .map(|(raw, value)| (unsafe { KeyID::new(raw as u16) }, value))
+        self.data.iter_mut().enumerate().map(|(raw, value)| (unsafe { KeyID::new(raw as u16) }, value))
     }
     pub fn clear(&mut self) {
         self.data.clear();
@@ -68,10 +60,7 @@ struct Global {
     table: HashTable<KeyID>,
     buffer_used: usize,
 }
-static TABLE: Mutex<Global> = Mutex::new(Global {
-    table: HashTable::new(),
-    buffer_used: 0,
-});
+static TABLE: Mutex<Global> = Mutex::new(Global { table: HashTable::new(), buffer_used: 0 });
 
 // fn name() {
 //     unsafe { BUFFER }
@@ -95,6 +84,20 @@ impl<'a> PartialEq<StaticKey> for KeyID {
 }
 
 impl KeyID {
+    pub fn try_raw_to_str(raw: u16) -> Option<&'static str> {
+        if raw < MIN_DYN_KEY {
+            return StaticKey::from_u8(raw as u8).map(|key| key.as_str());
+        }
+        let dyn_key_count = TABLE.lock().unwrap().table.len();
+        if raw >= MIN_DYN_KEY + dyn_key_count as u16 {
+            return None;
+        }
+        unsafe {
+            // check number of inserts to get max possible DYN_KEY
+
+            Some(KeyID::new(raw).as_str())
+        }
+    }
     pub fn raw(self) -> u16 {
         self.0
     }
@@ -144,11 +147,7 @@ impl KeyID {
         let len = table.len();
         let hasher = ahash::RandomState::with_seeds(0, 0, 0, 0);
         let hash = hasher.hash_one(name);
-        match table.entry(
-            hash,
-            |key| name == key.as_str(),
-            |value| hasher.hash_one(value.as_str()),
-        ) {
+        match table.entry(hash, |key| name == key.as_str(), |value| hasher.hash_one(value.as_str())) {
             hashbrown::hash_table::Entry::Occupied(entry) => *entry.get(),
             hashbrown::hash_table::Entry::Vacant(entry) => {
                 let start = *buffer_used;
@@ -156,16 +155,8 @@ impl KeyID {
                     panic!("GLOBAL KEY BUFFER SIZED EXCEEDED")
                 }
                 *buffer_used += name.len();
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        name.as_ptr(),
-                        BUFFER.as_ptr().add(start),
-                        name.len(),
-                    )
-                }
-                unsafe {
-                    *LUT.as_ptr().add(len as usize) = start as u32 | ((name.len() as u32) << 24)
-                }
+                unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), BUFFER.as_ptr().add(start), name.len()) }
+                unsafe { *LUT.as_ptr().add(len as usize) = start as u32 | ((name.len() as u32) << 24) }
 
                 let id = KeyID((len as u16) + MIN_DYN_KEY);
                 entry.insert(id);

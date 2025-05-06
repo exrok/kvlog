@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
+use crate::index::archetype::ServiceId;
 use crate::index::Index;
 const MAGIC: u64 = 0x8910_FC0Eu64 << 32;
 const ALT_MAGIC: u64 = 0xF745_119Eu64 << 32;
@@ -26,11 +27,7 @@ enum Chunk<'a> {
 
 impl<'a> Dechunker<'a> {
     fn new(buffer: &'a mut [u8]) -> Self {
-        Self {
-            buffer,
-            head: 0,
-            tail: 0,
-        }
+        Self { buffer, head: 0, tail: 0 }
     }
     fn read_from<R: std::io::Read>(&mut self, reader: &mut R) -> std::io::Result<usize> {
         if self.tail > self.buffer.len() / 2 && self.head > 0 {
@@ -71,17 +68,10 @@ impl<'a> Dechunker<'a> {
 }
 
 // "/tmp/libra-server.sock"
-pub fn block_on(
-    unix_socket_path: &Path,
-    index: &mut Index,
-    on_update: &mut dyn FnMut(),
-) -> io::Result<()> {
+pub fn block_on(unix_socket_path: &Path, index: &mut Index, on_update: &mut dyn FnMut()) -> io::Result<()> {
     let _ = std::fs::remove_file(unix_socket_path);
     let listener = UnixListener::bind(unix_socket_path)?;
-    let server = Server {
-        index,
-        update_signal: on_update,
-    };
+    let server = Server { index, update_signal: on_update };
     run_server(listener, server)
 }
 
@@ -92,7 +82,7 @@ struct Server<'a> {
 
 struct Connection {
     stream: UnixStream,
-    service_name: Option<Box<str>>,
+    service_id: Option<ServiceId>,
 }
 
 impl<'a> Server<'a> {
@@ -100,18 +90,18 @@ impl<'a> Server<'a> {
         match std::str::from_utf8(data) {
             Ok(service_name) => {
                 kvlog::info!("Metadata updated for connection", service_name);
-                connection.service_name = Some(service_name.into());
+                connection.service_id = Some(ServiceId::intern(service_name));
             }
             Err(err) => {
                 kvlog::error!("Failed to parse service name update", ?err, data);
             }
         }
     }
-    fn process(&mut self, _connection: &mut Connection, mut data: &[u8]) {
+    fn process(&mut self, conn: &mut Connection, mut data: &[u8]) {
         while !data.is_empty() {
             match kvlog::encoding::munch_log_with_span(&mut data) {
                 Ok((timestamp, level, span_info, fields)) => {
-                    if let Err(err) = self.index.write(timestamp, level, span_info, fields) {
+                    if let Err(err) = self.index.write(timestamp, level, span_info, conn.service_id, fields) {
                         kvlog::error!("Failed to write log to index", ?err)
                     }
                 }
@@ -142,19 +132,14 @@ fn run_server(mut listener: UnixListener, server: Server) -> io::Result<()> {
     // Setup the TCP server socket.
 
     // Register the server with poll we can receive events for it.
-    poll.registry()
-        .register(&mut listener, SERVER, Interest::READABLE)?;
+    poll.registry().register(&mut listener, SERVER, Interest::READABLE)?;
 
     // Map of `Token` -> `TcpStream`.
     // todo switch to use a slab
     let mut connections = HashMap::new();
     // Unique token for each incoming connection.
     let mut unique_token = Token(SERVER.0 + 1);
-    let mut controller = MioController {
-        buffer: vec![0; 4096 * 8],
-        poll,
-        server,
-    };
+    let mut controller = MioController { buffer: vec![0; 4096 * 8], poll, server };
 
     loop {
         if let Err(err) = controller.poll.poll(&mut events, None) {
@@ -186,18 +171,9 @@ fn run_server(mut listener: UnixListener, server: Server) -> io::Result<()> {
                     };
 
                     let token = next(&mut unique_token);
-                    controller
-                        .poll
-                        .registry()
-                        .register(&mut stream, token, Interest::READABLE)?;
+                    controller.poll.registry().register(&mut stream, token, Interest::READABLE)?;
 
-                    connections.insert(
-                        token,
-                        Connection {
-                            stream,
-                            service_name: None,
-                        },
-                    );
+                    connections.insert(token, Connection { stream, service_id: None });
                 },
                 token => {
                     // Maybe received an event for a TCP connection.
@@ -209,10 +185,7 @@ fn run_server(mut listener: UnixListener, server: Server) -> io::Result<()> {
                     };
                     if done {
                         if let Some(mut connection) = connections.remove(&token) {
-                            controller
-                                .poll
-                                .registry()
-                                .deregister(&mut connection.stream)?;
+                            controller.poll.registry().deregister(&mut connection.stream)?;
                         }
                     }
                 }
@@ -228,11 +201,7 @@ struct MioController<'a> {
     buffer: Vec<u8>,
 }
 impl<'a> MioController<'a> {
-    fn handle_connection_event(
-        &mut self,
-        connection: &mut Connection,
-        event: &Event,
-    ) -> io::Result<bool> {
+    fn handle_connection_event(&mut self, connection: &mut Connection, event: &Event) -> io::Result<bool> {
         if event.is_readable() {
             let mut connection_closed = false;
             let mut dechunker = Dechunker::new(&mut self.buffer);
@@ -253,7 +222,7 @@ impl<'a> MioController<'a> {
                             Chunk::InvalidMagic => {
                                 kvlog::error!(
                                     "Invalid magic read from connection",
-                                    service_name = connection.service_name
+                                    service_name = connection.service_id.map(|a| a.as_str())
                                 );
                                 break 'reading;
                             }

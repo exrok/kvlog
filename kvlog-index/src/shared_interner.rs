@@ -35,6 +35,9 @@ struct InnerBuffer {
     written: usize,
 }
 
+unsafe impl Sync for SharedIntermentBuffer {}
+unsafe impl Send for SharedIntermentBuffer {}
+
 pub struct SharedIntermentBuffer {
     hasher: RandomState,
     lut: Mutex<InnerBuffer>,
@@ -53,23 +56,16 @@ pub struct IntermentInsertionPoller {
 impl SharedIntermentBuffer {
     pub fn with_capacity(data_capacity: usize) -> SharedIntermentBuffer {
         let data = unsafe {
-            NonNull::new(std::alloc::alloc(
-                std::alloc::Layout::from_size_align(data_capacity, 1).unwrap(),
-            ))
-            .unwrap()
+            NonNull::new(std::alloc::alloc(std::alloc::Layout::from_size_align(data_capacity, 1).unwrap())).unwrap()
         };
         let slices = unsafe {
-            NonNull::new(std::alloc::alloc(
-                std::alloc::Layout::array::<InternedRange>(u16::MAX as usize).unwrap(),
-            ) as *mut InternedRange)
+            NonNull::new(std::alloc::alloc(std::alloc::Layout::array::<InternedRange>(u16::MAX as usize).unwrap())
+                as *mut InternedRange)
             .unwrap()
         };
         SharedIntermentBuffer {
             hasher: RandomState::new(),
-            lut: Mutex::new(InnerBuffer {
-                lookup: HashTable::default(),
-                written: 0,
-            }),
+            lut: Mutex::new(InnerBuffer { lookup: HashTable::default(), written: 0 }),
             data_capacity,
             data,
             slices,
@@ -105,19 +101,11 @@ impl SharedIntermentBuffer {
                 }
                 let start = inner.written;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        value.as_ptr(),
-                        self.data.as_ptr().add(start),
-                        value.len(),
-                    );
+                    std::ptr::copy_nonoverlapping(value.as_ptr(), self.data.as_ptr().add(start), value.len());
                 }
                 inner.written += value.len();
                 let len = value.len() as u16;
-                let range = InternedRange {
-                    data: id,
-                    offset: start as u32,
-                    len,
-                };
+                let range = InternedRange { data: id, offset: start as u32, len };
                 entry.insert(range);
                 unsafe {
                     self.slices.as_ptr().add(id as usize).write(range);
@@ -128,10 +116,7 @@ impl SharedIntermentBuffer {
         }
     }
     unsafe fn bytes_unchecked(&self, range: InternedRange) -> &[u8] {
-        std::slice::from_raw_parts(
-            self.data.as_ptr().add(range.offset as usize),
-            range.len as usize,
-        )
+        std::slice::from_raw_parts(self.data.as_ptr().add(range.offset as usize), range.len as usize)
     }
     unsafe fn data_unchecked(&self, range: InternedRange) -> &str {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(
@@ -143,10 +128,7 @@ impl SharedIntermentBuffer {
         Mapper {
             data: self.data,
             slices: unsafe {
-                std::slice::from_raw_parts(
-                    self.slices.as_ptr(),
-                    self.len.load(std::sync::atomic::Ordering::Acquire),
-                )
+                std::slice::from_raw_parts(self.slices.as_ptr(), self.len.load(std::sync::atomic::Ordering::Acquire))
             },
         }
     }
@@ -158,28 +140,27 @@ impl SharedIntermentBuffer {
         let new_next = mapper.slices.len();
         mapper.slices = mapper.slices.get(poller.next..).unwrap_or_default();
         poller.next = new_next;
-        mapper
-            .slices
-            .iter()
-            .map(|range| (range.data, unsafe { self.data_unchecked(*range) }))
+        mapper.slices.iter().map(|range| (range.data, unsafe { self.data_unchecked(*range) }))
     }
     pub fn iter(&self) -> impl Iterator<Item = (u16, &str)> + '_ {
-        self.mapper()
-            .slices
-            .iter()
-            .map(|range| (range.data, unsafe { self.data_unchecked(*range) }))
+        /// some code assumes range.data = index in slice
+        self.mapper().slices.iter().map(|range| (range.data, unsafe { self.data_unchecked(*range) }))
     }
 }
 
 pub struct Mapper<'a> {
-    data: NonNull<u8>,
-    slices: &'a [InternedRange],
+    pub(crate) data: NonNull<u8>,
+    pub(crate) slices: &'a [InternedRange],
 }
 impl<'a> Mapper<'a> {
+    pub fn len(&self) -> usize {
+        self.slices.len()
+    }
+    pub fn empty() -> Mapper<'a> {
+        Mapper { data: NonNull::dangling(), slices: &[] }
+    }
     pub fn iter(&self) -> impl Iterator<Item = (u16, &str)> + '_ {
-        self.slices
-            .iter()
-            .map(|range| (range.data, unsafe { self.data_unchecked(*range) }))
+        self.slices.iter().map(|range| (range.data, unsafe { self.data_unchecked(*range) }))
     }
     unsafe fn data_unchecked(&self, range: InternedRange) -> &str {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(

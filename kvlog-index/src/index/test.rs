@@ -6,7 +6,9 @@ use std::{
 use kvlog::{encoding::FieldBuffer, Encode};
 use test::filter::Query;
 
-use self::filter::FieldFilter;
+use crate::index::filter::LevelFilter;
+
+use self::filter::QueryFilter;
 
 use super::*;
 
@@ -32,9 +34,7 @@ impl IndexPool {
         if ready.pool.is_empty() && ready.created < self.max {
             ready.created += 1;
             drop(ready);
-            return PoolGuard {
-                index: ManuallyDrop::new(Box::new(Index::new())),
-            };
+            return PoolGuard { index: ManuallyDrop::new(Box::new(Index::new())) };
         }
         while ready.pool.is_empty() {
             ready = self.cond.wait(ready).unwrap();
@@ -44,20 +44,12 @@ impl IndexPool {
         unsafe {
             index.clear_unchecked();
         }
-        PoolGuard {
-            index: ManuallyDrop::new(index),
-        }
+        PoolGuard { index: ManuallyDrop::new(index) }
     }
 }
 
-static GLOBAL_TEST_POOL: IndexPool = IndexPool {
-    max: 4,
-    cond: Condvar::new(),
-    ready: Mutex::new(ReadyPool {
-        pool: Vec::new(),
-        created: 0,
-    }),
-};
+static GLOBAL_TEST_POOL: IndexPool =
+    IndexPool { max: 4, cond: Condvar::new(), ready: Mutex::new(ReadyPool { pool: Vec::new(), created: 0 }) };
 
 pub struct PoolGuard {
     index: ManuallyDrop<Box<Index>>,
@@ -150,9 +142,7 @@ fn level_and_time_filters() {
             let lvl = LogLevel::from_u8((rng.rand_u32() & 0b11) as u8).unwrap();
             let ts = (i * 1024) | ((rng.rand_u32() as u64) & 0x3ff);
             level_buckets[lvl as usize].push(ts);
-            index
-                .write(ts, lvl, SpanInfo::None, LogFields::empty())
-                .unwrap();
+            index.write(ts, lvl, SpanInfo::None, None, LogFields::empty()).unwrap();
         }
         index.complete_bucket();
     }
@@ -185,10 +175,7 @@ fn level_and_time_filters() {
         }
     }
     // todo test exactly values
-    let tf = TimeFilter {
-        min_utc_ns: time_rt(0.3),
-        max_utc_ns: time_rt(0.5),
-    };
+    let tf = TimeFilter { min_utc_ns: time_rt(0.3), max_utc_ns: time_rt(0.5) };
     let expected = time_query(tf.min_utc_ns, tf.max_utc_ns, 0b101);
     assert!(expected.len() > 0);
     let query = &[LevelFilter { mask: 0b101 }.into(), tf.into()];
@@ -231,17 +218,9 @@ fn assert_eq_logs<'a, 'b>(
         assert_eq!(input.weak(), *expected, "Entry Mismatch");
     }
     let results_remaining = input_iter.take(512).count();
-    assert!(
-        results_remaining == 0,
-        "Found {} more entries then expected",
-        results_remaining
-    );
+    assert!(results_remaining == 0, "Found {} more entries then expected", results_remaining);
     let expected_remaining = expected_iter.count();
-    assert!(
-        expected_remaining == 0,
-        "Expected {} more entries",
-        expected_remaining,
-    );
+    assert!(expected_remaining == 0, "Expected {} more entries", expected_remaining,);
 }
 
 pub struct TestIndexWriter<'a> {
@@ -251,16 +230,24 @@ pub struct TestIndexWriter<'a> {
 }
 impl TestIndexWriter<'_> {
     pub fn new(index: &'_ mut Index) -> TestIndexWriter<'_> {
-        TestIndexWriter {
-            time: 1,
-            buf: FieldBuffer::default(),
-            index,
-        }
+        TestIndexWriter { time: 1, buf: FieldBuffer::default(), index }
     }
 }
+
+pub struct LogOptions {
+    pub level: LogLevel,
+    pub span: SpanInfo,
+    pub service: Option<ServiceId>,
+}
+impl Default for LogOptions {
+    fn default() -> Self {
+        Self { level: LogLevel::Info, span: SpanInfo::None, service: None }
+    }
+}
+
 #[macro_export]
 macro_rules! log {
-    ($buffer:ident $($level:ident)?; $($key:ident = $value:expr),*) => {{
+    ($buffer:ident ; $({$($meta:tt)*})? $($key:ident = $value:expr),*) => {{
         let time = $buffer.time;
         $buffer.time += 1;
         let fields = {
@@ -268,10 +255,8 @@ macro_rules! log {
             $( ($value).encode_log_value_into(encoder.key(stringify!($key)));)*
             encoder.fields()
         };
-        #[allow(unused)]
-        let mut level = LogLevel::Info;
-        $(level = LogLevel::$level;)?
-        $buffer.index.write(time, level, SpanInfo::None, fields).unwrap()
+        let opt = $crate::index::test::LogOptions{$($($meta)* ,)? ..Default::default()};
+        $buffer.index.write(time, opt.level, opt.span, opt.service, fields).unwrap()
     }};
 }
 
@@ -281,7 +266,7 @@ fn field_query() {
     let mut rng = oorandom::Rand32::new(0xdeafbeaf);
     let mut writer = TestIndexWriter::new(&mut index);
     let w0 = log!(writer; msg="nice", cats="nice");
-    let w1 = log!(writer Info; msg="nice hello", cats="what");
+    let w1 = log!(writer; msg="nice hello", cats="what");
     let w2 = log!(writer; msg="todo, nice hello", dogs="what");
 
     let query = Query::expr(stringify!(msg.contains("hello"))).unwrap();
@@ -301,7 +286,7 @@ fn int_query() {
     let mut rng = oorandom::Rand32::new(0xdeafbeaf);
     let mut writer = TestIndexWriter::new(&mut index);
     let w0 = log!(writer; msg="nice", count=3);
-    let w1 = log!(writer Info; msg="nice hello", count=1);
+    let w1 = log!(writer; msg="nice hello", count=1);
     let w2 = log!(writer; msg="todo, nice hello", dogs="what");
 
     let query = Query::expr(stringify!(count: int = 1)).unwrap();

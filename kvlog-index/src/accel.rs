@@ -17,12 +17,7 @@ impl MicroBloom {
         }
     }
     const H1: u64 = 0x80_80_80_80_80_80_80_80;
-    pub fn scan_reverse(
-        &self,
-        blooms: &[u64],
-        offset: usize,
-        mut func: impl FnMut(usize) -> bool,
-    ) -> bool {
+    pub fn scan_reverse(&self, blooms: &[u64], offset: usize, mut func: impl FnMut(usize) -> bool) -> bool {
         for (i, mid) in blooms.iter().enumerate().rev() {
             let bits = ((*mid) | self.base).wrapping_add(self.level & *mid) & Self::H1;
             let Some(mut mask) = NonZeroU64::new(bits.to_be()) else {
@@ -42,12 +37,7 @@ impl MicroBloom {
         }
         return true;
     }
-    pub fn scan_forward(
-        &self,
-        blooms: &[u64],
-        offset: usize,
-        mut func: impl FnMut(usize) -> bool,
-    ) -> bool {
+    pub fn scan_forward(&self, blooms: &[u64], offset: usize, mut func: impl FnMut(usize) -> bool) -> bool {
         for (i, mid) in blooms.iter().enumerate() {
             let bits = ((*mid) | self.base).wrapping_add(self.level & *mid) & Self::H1;
             let Some(mut mask) = NonZeroU64::new(bits) else {
@@ -140,8 +130,7 @@ pub unsafe fn single_field_query_forward(
 ) {
     let field_start = *offsets.as_ptr().add(range.start) as usize;
     let field_end = *offsets.as_ptr().add(range.end) as usize;
-    let mut fields_slice =
-        std::slice::from_raw_parts(fields.as_ptr().add(field_start), field_end - field_start);
+    let mut fields_slice = std::slice::from_raw_parts(fields.as_ptr().add(field_start), field_end - field_start);
     let offsetss = std::slice::from_raw_parts(offsets.as_ptr().add(range.start + 1), range.count());
     let mut offsets_walker = offsetss.iter().peekable();
     'outer: loop {
@@ -155,10 +144,8 @@ pub unsafe fn single_field_query_forward(
                     let field = (i as *const u32).offset_from(offsets.as_ptr()) as u32 - 1;
                     map(field);
                     let field_start = *i as usize;
-                    fields_slice = std::slice::from_raw_parts(
-                        fields.as_ptr().add(field_start),
-                        field_end - field_start,
-                    );
+                    fields_slice =
+                        std::slice::from_raw_parts(fields.as_ptr().add(field_start), field_end - field_start);
                     continue 'outer;
                 }
             }
@@ -177,8 +164,7 @@ pub unsafe fn single_field_query_reverse(
 ) {
     let field_start = *offsets.as_ptr().add(range.start) as usize;
     let field_end = *offsets.as_ptr().add(range.end) as usize;
-    let mut fields_slice =
-        std::slice::from_raw_parts(fields.as_ptr().add(field_start), field_end - field_start);
+    let mut fields_slice = std::slice::from_raw_parts(fields.as_ptr().add(field_start), field_end - field_start);
     let offsetss = std::slice::from_raw_parts(offsets.as_ptr().add(range.start + 1), range.count());
     let mut offsets_walker = offsetss.iter().rev().peekable();
     'outer: loop {
@@ -192,10 +178,8 @@ pub unsafe fn single_field_query_reverse(
                     let field = (i as *const u32).offset_from(offsets.as_ptr()) as u32;
                     map(field);
                     let field_start = *i as usize;
-                    fields_slice = std::slice::from_raw_parts(
-                        fields.as_ptr().add(field_start),
-                        field_end - field_start,
-                    );
+                    fields_slice =
+                        std::slice::from_raw_parts(fields.as_ptr().add(field_start), field_end - field_start);
                     continue 'outer;
                 }
             }
@@ -205,11 +189,7 @@ pub unsafe fn single_field_query_reverse(
     }
 }
 
-pub fn slow_bloom_query(
-    data: &[u8],
-    levels: u8,
-    extra: u8,
-) -> impl Iterator<Item = usize> + DoubleEndedIterator + '_ {
+pub fn slow_bloom_query(data: &[u8], levels: u8, extra: u8) -> impl Iterator<Item = usize> + DoubleEndedIterator + '_ {
     data.iter()
         .enumerate()
         .filter(move |(_, &mask)| ((mask & levels) != 0) && ((mask & extra) == extra))
@@ -352,10 +332,7 @@ pub fn collect_indices_of_values_in_set_reverse(
 
     let main_length = input_range.len() & !0b111;
     let main_data: &[[u16; 8]] = unsafe {
-        std::slice::from_raw_parts(
-            input.as_ptr().add(input_range.end - main_length).cast(),
-            main_length / 8,
-        )
+        std::slice::from_raw_parts(input.as_ptr().add(input_range.end - main_length).cast(), main_length / 8)
     };
 
     for i in main_data.iter().rev() {
@@ -406,12 +383,8 @@ pub fn collect_indices_of_values_in_set_reverse(
         output.set_len(new_len);
     }
 
-    let rest_data: &[u16] = unsafe {
-        std::slice::from_raw_parts(
-            input.as_ptr().add(input_range.start),
-            input_range.len() & 0b111,
-        )
-    };
+    let rest_data: &[u16] =
+        unsafe { std::slice::from_raw_parts(input.as_ptr().add(input_range.start), input_range.len() & 0b111) };
 
     // Process remaining items in reverse order
     for i in rest_data.iter().rev() {
@@ -479,10 +452,7 @@ mod test {
     }
     impl Default for FieldsMap {
         fn default() -> Self {
-            Self {
-                fields: Default::default(),
-                offsets: vec![0],
-            }
+            Self { fields: Default::default(), offsets: vec![0] }
         }
     }
 
@@ -501,9 +471,7 @@ mod test {
         let mut output = Vec::new();
         collect_indices_of_values_in_set_forward(
             &set,
-            &[
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-            ],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
             0..17,
             &mut output,
             10,
@@ -512,9 +480,7 @@ mod test {
         output.clear();
         collect_indices_of_values_in_set_reverse(
             &set,
-            &[
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-            ],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
             0..17,
             &mut output,
             10,

@@ -352,6 +352,7 @@ impl SmartCollector {
     fn output(&mut self, buffer: &mut [u8]) {
         if let Some(stream) = self.try_connect_stream(Duration::from_millis(500)) {
             if let Err(err) = stream.write_all(attach_prelude(buffer)) {
+                println!("stream write failure {:?}", err);
                 use crate as kvlog;
                 {
                     use kvlog::encoding::Encode;

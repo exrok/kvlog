@@ -43,6 +43,7 @@ impl BloomBuilder {
 }
 
 #[derive(Default, Copy, Clone, Debug)]
+#[repr(transparent)]
 pub struct BloomLine(pub u8);
 
 impl BloomLine {

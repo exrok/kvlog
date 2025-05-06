@@ -1,5 +1,7 @@
 #![allow(warnings, unsued)]
 
+use std::path::Path;
+
 use kvlog::{
     encoding::{munch_log_with_span, Key, LogFields, MunchError, StaticKey, Value},
     LogLevel, SpanID,
@@ -7,7 +9,7 @@ use kvlog::{
 
 use kvlog_index::{
     accel::{slow_bloom_query, MicroBloom},
-    index::{FieldKind, GeneralFilter, Index, LevelFilter, Query, TimeFilter},
+    index::{FieldKind, GeneralFilter, Index, Query, TimeFilter},
 };
 
 struct SyndromeDefintion {
@@ -100,9 +102,40 @@ fn parse_check() {
         println!("{:?}", token);
     }
 }
+fn ingest_single_file(path: &Path, index: &mut Index) {
+    let timer = kvlog::Timer::start();
+    let contents = std::fs::read(path).unwrap();
+    let mut cursor: &[u8] = &contents;
+    let mut count = 0;
+    while !cursor.is_empty() {
+        count += 1;
+        match kvlog::encoding::munch_log_with_span(&mut cursor) {
+            Ok((timestamp, level, span_info, fields)) => {
+                if let Err(err) = index.write(timestamp, level, span_info, None, fields) {
+                    panic!("Failed to write log to index: {err:?}")
+                }
+            }
+            Err(MunchError::EofOnHeader | MunchError::EofOnFields | MunchError::Eof) => {
+                panic!("Unexpected EOF")
+            }
+            Err(err) => {
+                panic!("Error munching logs: {err:?}");
+            }
+        }
+    }
+
+    let memory_usage = index.current_bucket_memory_used();
+
+    println!(
+        "{:.1} MB {:.2} bytes / log, Stats [{}] {:#?}",
+        memory_usage.total() as f64 / (1024.0 * 1024.0),
+        memory_usage.bytes_per_log(),
+        index.generation(),
+        memory_usage
+    );
+    kvlog::info!("Logs read from file", ?path, count, elapsed = timer);
+}
 fn main() {
-    parse_check();
-    return;
     // println!("{:X}", interleave(0xff));
     // return;
     let mut index = Index::new();
@@ -216,6 +249,7 @@ fn main() {
                     timestamp,
                     http_request[0].level,
                     kvlog::SpanInfo::Start { span, parent: None },
+                    None,
                     RandomFields { rng: rng.clone(), syndrome: &http_request[0], stage: 0 },
                 )
                 .unwrap();
@@ -228,6 +262,7 @@ fn main() {
                         timestamp,
                         syndrome.level,
                         kvlog::SpanInfo::Current { span },
+                        None,
                         RandomFields { rng: rng.clone(), syndrome, stage: 0 },
                     )
                     .unwrap();
@@ -238,6 +273,7 @@ fn main() {
                     timestamp,
                     http_request[1].level,
                     kvlog::SpanInfo::End { span },
+                    None,
                     RandomFields { rng: rng.clone(), syndrome: &http_request[1], stage: 0 },
                 )
                 .unwrap();
@@ -250,6 +286,7 @@ fn main() {
                 timestamp,
                 syndrome.level,
                 kvlog::SpanInfo::None,
+                None,
                 RandomFields { rng: rng.clone(), syndrome, stage: 0 },
             )
             .unwrap();
@@ -269,6 +306,7 @@ fn main() {
         // write!(string, "msg.contains(\"User\")");
         let query = Query::expr(&string).unwrap();
         for entry in index.reverse_query(&query.filters) {
+            // println!("{}", entry.message().escape_ascii());
             // println!("{} {:?}", entry.message().escape_ascii(), entry.fields());
             // println!("__");
             count += 1;
