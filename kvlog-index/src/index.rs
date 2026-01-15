@@ -1165,6 +1165,35 @@ impl IndexReader {
         };
         walker
     }
+    /// Creates a forward query walker starting from the oldest available bucket.
+    ///
+    /// Unlike [`forward_query`], which starts from recent buckets, this method
+    /// begins iteration from generation 0, returning logs in insertion order
+    /// starting from the oldest available entries.
+    ///
+    /// [`forward_query`]: Self::forward_query
+    pub fn forward_query_from_oldest<'a>(
+        &'a self,
+        filters: &'a [GeneralFilter],
+    ) -> ForwardQueryWalker<'a> {
+        let mut time_range = TimeFilter { min_utc_ns: 0, max_utc_ns: u64::MAX };
+        for filter in filters {
+            if let GeneralFilter::Time(filter) = filter {
+                time_range.min_utc_ns = time_range.min_utc_ns.max(filter.min_utc_ns);
+                time_range.max_utc_ns = time_range.max_utc_ns.min(filter.max_utc_ns);
+            }
+        }
+        if time_range.max_utc_ns != u64::MAX {
+            time_range.min_utc_ns = time_range.min_utc_ns.max(1)
+        }
+        ForwardQueryWalker {
+            general_filter: filters,
+            time_range,
+            segments: ForwardSegmentWalker::new(0),
+            index: self,
+            strategy: QueryStrategy::Simple,
+        }
+    }
     pub fn reverse_query<'a>(&'a self, filters: &'a [GeneralFilter]) -> ReverseQueryWalker<'a> {
         let mut time_range = TimeFilter { min_utc_ns: 0, max_utc_ns: u64::MAX };
         for filter in filters {

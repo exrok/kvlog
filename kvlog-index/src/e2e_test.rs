@@ -243,8 +243,9 @@ fn in_operator() {
     assert_query_results! {
         test_query [ (a == "alpha" && b == "beta") || v > 20 ]
         {instructions: 1}
-        (a = "alpha", v = 32): true,
-        (b = "beta", v = 10): true,
+        (a = "alpha", v = 32): true,           // matches: v > 20
+        (a = "alpha", b = "beta"): true,       // matches: a == "alpha" && b == "beta"
+        (b = "beta", v = 10): false,           // no match: a missing, v <= 20
         (method = "PATCH"): false,
         (worst = "POST"): false,
     }
