@@ -657,10 +657,13 @@ fn specialize_with_archetype_index(
 
                 match QueryVm::compile(bump, pred, bucket, reader.targets.mapper()) {
                     Ok(vm) => {
+                        println!("{:?}", pred);
+                        vm.print();
                         let vm_filter = VmFilter {
                             filter: unsafe { std::mem::transmute::<QueryVm, QueryVm<'static>>(vm) },
                             bump: ibump,
                         };
+
                         return QueryStrategy::ArchetypeWithVm { archetypes: possible_archetypes, vm: vm_filter };
                     }
                     Err(err) => {

@@ -30,11 +30,12 @@ fn compile_field_tests<'b>(
     key: KeyID,
     tests: &[FieldTest<'b>],
 ) -> Result<(), VmCompileError> {
-    let types = maps.keys.get(key).map(|info| info.kinds).unwrap_or_default();
-    let mut field_eqs: Vec<Field> = Vec::new();
     if and {
         std::mem::swap(&mut fail, &mut succ);
     }
+
+    let types = maps.keys.get(key).map(|info| info.kinds).unwrap_or_default();
+    let mut field_eqs: Vec<Field> = Vec::new();
     let bb = asm.block(Some(parent), fail);
     for test in tests {
         let mut fail_t = Ret::Next(bb);

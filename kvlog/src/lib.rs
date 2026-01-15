@@ -4,14 +4,16 @@ use std::{
     num::NonZeroU64,
     path::PathBuf,
     str::FromStr,
-    sync::{atomic::AtomicU64, MutexGuard},
+    sync::{atomic::AtomicU64, MutexGuard as StdMutexGuard},
 };
 
 use collector::{LogQueue, LoggerGuard};
 pub use encoding::BStr;
 pub use encoding::{Encode, SpanInfo, ValueEncoder};
+mod mutex;
 mod spanning;
 mod timestamp;
+pub use mutex::{Mutex, MutexGuard};
 pub use spanning::Spanning;
 pub use timestamp::Timestamp;
 
@@ -64,7 +66,7 @@ pub struct EnteredSpan {
     previous: u64,
 }
 
-pub fn global_logger() -> MutexGuard<'static, LogQueue> {
+pub fn global_logger() -> StdMutexGuard<'static, LogQueue> {
     match crate::collector::LOG_WRITER.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -85,6 +87,11 @@ pub fn continue_span<T: Sized>(t: T) -> Spanning<T> {
 }
 
 impl SpanID {
+    pub fn enter(&self) -> EnteredSpan {
+        EnteredSpan {
+            previous: CURRENT_SPAN_ID.replace(self.inner.get()),
+        }
+    }
     pub fn as_u64(&self) -> u64 {
         self.inner.get()
     }
@@ -110,11 +117,6 @@ impl SpanID {
             Some(SpanID { inner: value })
         } else {
             None
-        }
-    }
-    pub fn enter(&self) -> EnteredSpan {
-        EnteredSpan {
-            previous: CURRENT_SPAN_ID.replace(self.inner.get()),
         }
     }
 }

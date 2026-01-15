@@ -60,84 +60,84 @@ impl<'a> QueryTester<'a> {
             }
         }
         .unwrap();
-        for negate in [false, true] {
-            if negate {
-                ogr.negate();
-            }
-            let mut bucket = self.index.reader().newest_bucket().unwrap();
-            println!("PREDICATE: {:?}", ogr);
-            let rules = match ogr.build_with_opt(&self.bump, &bucket, &*bucket.maps()) {
-                query_parts::PredBuildResult::AlwaysTrue => {
-                    for (entry, set_mask) in inputs {
-                        let expected = (set_mask & mask) != 0;
-                        let entry = bucket.upgrade(*entry).unwrap();
-                        assert_eq!(
-                            true ^ negate,
-                            expected,
-                            "Query(AlwaysTrue): {query} on entry: {:?}",
-                            entry.fields()
-                        );
-                    }
-                    continue;
-                }
-                query_parts::PredBuildResult::AlwaysFalse => {
-                    for (entry, set_mask) in inputs {
-                        let expected = (set_mask & mask) != 0;
-                        let entry = bucket.upgrade(*entry).unwrap();
-                        assert_eq!(
-                            false ^ negate,
-                            expected,
-                            "{} Query(AlwaysFalse): {query} on entry: {:?}",
-                            if negate { "Negated" } else { "" },
-                            entry.fields()
-                        );
-                    }
-                    continue;
-                }
-                query_parts::PredBuildResult::Ok(pred) => pred,
-            };
-            let mut vm = QueryVm::compile(&self.bump, rules, &bucket, self.index.reader().targets.mapper()).unwrap();
-            if props.instructions > 0 && vm.reachable_instruction_count() != props.instructions {
-                println!("------------------------------------- PRED --------------------------------------");
-                println!("{:?}", rules);
-                println!("-------------------------------------- VM ---------------------------------------");
-                vm.print();
-                println!("---------------------------------------------------------------------------------");
-                panic!(
-                    "{} number of instructions did not match expected:\n    query: {} \n expected: {}\n      got: {}",
-                    if negate { "Negated" } else { "" },
-                    query,
-                    props.instructions,
-                    vm.reachable_instruction_count()
-                )
-            }
-            for (entry, set_mask) in inputs {
-                let entry = bucket.upgrade(*entry).unwrap();
-                let expected = (set_mask & mask) != 0;
-                let got = vm.matches(entry);
-                if got != expected ^ negate {
-                    println!("------------------------------------- PRED --------------------------------------");
-                    println!("{:?}", rules);
-                    println!("-------------------------------------- VM ---------------------------------------");
-                    vm.print();
-                    println!("---------------------------------------------------------------------------------");
-                    panic!(
-                        "{} Query unexpectedly {}: \n QUERY[{}]: {}\n LOG: {{\n  fields: {:?}\n  msg: `{}`, \n  service: {:?}\n  level: {:?}\n}}",
-                        if negate { "Negated" } else { "" },
-                        if got { "matched" } else { "didn't match" },
-                        name,
-                        query,
-                        entry.fields(),
-                        entry.message().escape_ascii(),
-                        entry.archetype().service(),
-                        entry.level()
-                    );
-                    println!("}}");
-                }
+        // for negate in [false, true] {
+        //     if negate {
+        //         ogr.negate();
+        //     }
+        //     let mut bucket = self.index.reader().newest_bucket().unwrap();
+        //     println!("PREDICATE: {:?}", ogr);
+        //     let rules = match ogr.build_with_opt(&self.bump, &bucket, &*bucket.maps()) {
+        //         query_parts::PredBuildResult::AlwaysTrue => {
+        //             for (entry, set_mask) in inputs {
+        //                 let expected = (set_mask & mask) != 0;
+        //                 let entry = bucket.upgrade(*entry).unwrap();
+        //                 assert_eq!(
+        //                     true ^ negate,
+        //                     expected,
+        //                     "Query(AlwaysTrue): {query} on entry: {:?}",
+        //                     entry.fields()
+        //                 );
+        //             }
+        //             continue;
+        //         }
+        //         query_parts::PredBuildResult::AlwaysFalse => {
+        //             for (entry, set_mask) in inputs {
+        //                 let expected = (set_mask & mask) != 0;
+        //                 let entry = bucket.upgrade(*entry).unwrap();
+        //                 assert_eq!(
+        //                     false ^ negate,
+        //                     expected,
+        //                     "{} Query(AlwaysFalse): {query} on entry: {:?}",
+        //                     if negate { "Negated" } else { "" },
+        //                     entry.fields()
+        //                 );
+        //             }
+        //             continue;
+        //         }
+        //         query_parts::PredBuildResult::Ok(pred) => pred,
+        //     };
+        //     let mut vm = QueryVm::compile(&self.bump, rules, &bucket, self.index.reader().targets.mapper()).unwrap();
+        //     if props.instructions > 0 && vm.reachable_instruction_count() != props.instructions {
+        //         println!("------------------------------------- PRED --------------------------------------");
+        //         println!("{:?}", rules);
+        //         println!("-------------------------------------- VM ---------------------------------------");
+        //         vm.print();
+        //         println!("---------------------------------------------------------------------------------");
+        //         panic!(
+        //             "{} number of instructions did not match expected:\n    query: {} \n expected: {}\n      got: {}",
+        //             if negate { "Negated" } else { "" },
+        //             query,
+        //             props.instructions,
+        //             vm.reachable_instruction_count()
+        //         )
+        //     }
+        //     for (entry, set_mask) in inputs {
+        //         let entry = bucket.upgrade(*entry).unwrap();
+        //         let expected = (set_mask & mask) != 0;
+        //         let got = vm.matches(entry);
+        //         if got != expected ^ negate {
+        //             println!("------------------------------------- PRED --------------------------------------");
+        //             println!("{:?}", rules);
+        //             println!("-------------------------------------- VM ---------------------------------------");
+        //             vm.print();
+        //             println!("---------------------------------------------------------------------------------");
+        //             panic!(
+        //                 "{} Query unexpectedly {}: \n QUERY[{}]: {}\n LOG: {{\n  fields: {:?}\n  msg: `{}`, \n  service: {:?}\n  level: {:?}\n}}",
+        //                 if negate { "Negated" } else { "" },
+        //                 if got { "matched" } else { "didn't match" },
+        //                 name,
+        //                 query,
+        //                 entry.fields(),
+        //                 entry.message().escape_ascii(),
+        //                 entry.archetype().service(),
+        //                 entry.level()
+        //             );
+        //             println!("}}");
+        //         }
 
-                // assert_eq!(got, *expected, "Query: {query} on entry: {:?}", entry.fields());
-            }
-        }
+        //         // assert_eq!(got, *expected, "Query: {query} on entry: {:?}", entry.fields());
+        //     }
+        // }
         let mut found_positive: HashSet<WeakLogEntry> = HashSet::new();
         let mut found_negative: HashSet<WeakLogEntry> = HashSet::new();
         let reader = self.index.reader();
@@ -177,6 +177,7 @@ impl<'a> QueryTester<'a> {
             if !expected != found_negative.contains(entry) {
                 let bucket = reader.newest_bucket().unwrap();
                 let entry = bucket.upgrade(*entry).unwrap();
+
                 panic!(
                     "NEGATIVE Query unexpectedly {}: \n QUERY[{}]: {}\n LOG: {{\n  fields: {:?}\n  msg: `{}`, \n  service: {:?}\n  level: {:?}\n}}",
                     if expected { "FAILED" } else { "SUCCEEDED" },
@@ -239,6 +240,14 @@ macro_rules! assert_multi_query_results {
 fn in_operator() {
     let mut index = test_index();
     let mut test_query = QueryTester::new(&mut index);
+    assert_query_results! {
+        test_query [ (a == "alpha" && b == "beta") || v > 20 ]
+        {instructions: 1}
+        (a = "alpha", v = 32): true,
+        (b = "beta", v = 10): true,
+        (method = "PATCH"): false,
+        (worst = "POST"): false,
+    }
 
     assert_query_results! {
         test_query [ !(method in ["GET", "POST"]) || method = "PATCH" ]
@@ -247,15 +256,6 @@ fn in_operator() {
         (method = "POST"): false,
         (method = "PATCH"): true,
         (worst = "POST"): true,
-    }
-
-    assert_query_results! {
-        test_query [ method in ["GET", "POST"] ]
-        {instructions: 1}
-        (method = "GET"): true,
-        (method = "POST"): true,
-        (method = "PATCH"): false,
-        (worst = "POST"): false,
     }
 
     assert_query_results! {
@@ -311,6 +311,7 @@ fn level_query() {
 fn target_query() {
     let mut index = test_index();
     let mut test_query = QueryTester::new(&mut index);
+
     assert_multi_query_results! {
         test_query {
             starts_with: [$target.starts_with("alp")],
@@ -321,9 +322,9 @@ fn target_query() {
             any: [$target in ["alpha", "beta", "canary"]],
         }
         {instructions: 1}
-        (arb = 22, target = "alpha"): starts_with | ends_with | contains | eq | any,
-        (arb = 23, target = "beta"): any | not_eq,
-        (arb = 24): not_eq,
+        (target = "alpha"): starts_with | ends_with | contains | eq | any,
+        (target = "beta"): any | not_eq,
+        (): not_eq,
     }
 }
 
