@@ -309,7 +309,7 @@ impl SmartCollector {
         // work around borrow checker limitation (so no if let here)
         if self.stream.is_none() {
             let now = std::time::Instant::now();
-            if self.last_polled.duration_since(now) >= retry_duration {
+            if now.duration_since(self.last_polled) < retry_duration {
                 return None;
             }
             self.last_polled = now;
@@ -368,6 +368,7 @@ impl SmartCollector {
                     log.poke();
                 };
                 self.stream = None;
+                self.current_socket_modified_at = None;
             } else {
                 return;
             }
