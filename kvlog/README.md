@@ -1,8 +1,13 @@
-# kvlog
+# kvlog: High-performance structured binary logging for Rust.
 
-High-performance structured binary logging for Rust.
+[![Crates.io](https://img.shields.io/crates/v/kvlog?style=flat-square)](https://crates.io/crates/jsony)
+[![Docs.rs](https://img.shields.io/docsrs/kvlog?style=flat-square)](https://docs.rs/jsony/latest/jsony/)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+
 
 kvlog provides macros for emitting structured log messages with key-value pairs, optimized for high throughput and fast compile times. Log messages are encoded in a compact binary format with nanosecond-resolution timestamps.
+
+![landing](https://github.com/user-attachments/assets/72b40382-ed67-430b-a2f5-a73dd0633b7b)
 
 ## Usage
 
