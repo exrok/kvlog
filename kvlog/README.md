@@ -1,9 +1,8 @@
 # kvlog: High-performance structured binary logging for Rust.
 
-[![Crates.io](https://img.shields.io/crates/v/kvlog?style=flat-square)](https://crates.io/crates/jsony)
-[![Docs.rs](https://img.shields.io/docsrs/kvlog?style=flat-square)](https://docs.rs/jsony/latest/jsony/)
+[![Crates.io](https://img.shields.io/crates/v/kvlog?style=flat-square)](https://crates.io/crates/kvlog)
+[![Docs.rs](https://img.shields.io/docsrs/kvlog?style=flat-square)](https://docs.rs/kvlog/latest/kvlog/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-
 
 kvlog provides macros for emitting structured log messages with key-value pairs, optimized for high throughput and fast compile times. Log messages are encoded in a compact binary format with nanosecond-resolution timestamps.
 
@@ -157,14 +156,15 @@ For production or when you need specific output behavior, configure a collector 
 
 Format: `[SERVICE_NAME@]KIND[:PATH]`
 
-| Kind | Description |
-|------|-------------|
-| `Stdout` | Log to standard output |
-| `Directory:/path` | Log to timestamped files in directory |
-| `SingleFile:/path` | Log to a single file |
-| `SocketOrStdout` | Log to Unix socket, fallback to stdout |
+| Kind               | Description                            |
+| ------------------ | -------------------------------------- |
+| `Stdout`           | Log to standard output                 |
+| `Directory:/path`  | Log to timestamped files in directory  |
+| `SingleFile:/path` | Log to a single file                   |
+| `SocketOrStdout`   | Log to Unix socket, fallback to stdout |
 
 Examples:
+
 - `Stdout`
 - `Directory:/var/log/my_app`
 - `SingleFile:/tmp/app.log`
