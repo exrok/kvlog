@@ -1,3 +1,8 @@
+/// Mutex wrapper that logs warnings when held for too long in debug builds.
+///
+/// In debug builds, holding the lock for more than 1 millisecond will emit
+/// an error-level log message. In release builds, this behaves identically
+/// to [`std::sync::Mutex`].
 pub struct Mutex<T: ?Sized> {
     inner: std::sync::Mutex<T>,
 }
@@ -52,6 +57,10 @@ impl DropTracker {
     }
 }
 
+/// lock guard returned by [`Mutex::lock`].
+///
+/// Releases the lock when dropped. In debug builds, logs a warning if the
+/// lock was held for more than 1 millisecond.
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     inner: std::sync::MutexGuard<'a, T>,
     #[cfg(debug_assertions)]
@@ -59,6 +68,7 @@ pub struct MutexGuard<'a, T: ?Sized + 'a> {
 }
 
 impl<T> Mutex<T> {
+    /// Creates a new mutex wrapping the given value.
     pub const fn new(t: T) -> Mutex<T> {
         Mutex {
             inner: std::sync::Mutex::new(t),
@@ -66,6 +76,11 @@ impl<T> Mutex<T> {
     }
 }
 impl<T: ?Sized> Mutex<T> {
+    /// Acquires the mutex, blocking until it becomes available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn lock(&self) -> MutexGuard<'_, T> {
         MutexGuard {

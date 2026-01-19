@@ -14,7 +14,6 @@ use crate::{
         query_parts::{FieldPredicate, FieldTest, Pred, PredBuilder},
         QueryExpr, QueryParseError,
     },
-    server::block_on,
     ServiceId,
 };
 

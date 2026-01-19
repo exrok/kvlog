@@ -1,3 +1,32 @@
+//! Log collection and output infrastructure.
+//!
+//! This module provides functions for initializing log collectors that process
+//! and output log messages. A collector runs on a background thread and handles
+//! batching, formatting, and writing logs to various destinations.
+//!
+//! # Quick Start
+//!
+//! The easiest way to set up logging is with [`init_stdout_logger`]:
+//!
+//! ```no_run
+//! let _guard = kvlog::collector::init_stdout_logger();
+//! kvlog::info!("Application started");
+//! // Logs are written to stdout
+//! ```
+//!
+//! # Collector Types
+//!
+//! - [`init_stdout_logger`]: Writes formatted logs to stdout
+//! - [`init_file_logger`]: Appends binary logs to a single file
+//! - [`init_directory_logger`]: Writes to rotating files in a directory
+//! - [`init_closure_logger`]: Custom processing via a closure
+//!
+//! # Guard Lifetime
+//!
+//! All initialization functions return a [`LoggerGuard`] that must be held
+//! for the duration of logging. When the guard is dropped, the collector
+//! thread is flushed and terminated.
+
 use std::alloc::Layout;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -8,8 +37,90 @@ use std::{fs::File, io::IsTerminal};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
-use crate::encoding::{now, Encoder, StaticKey};
-use crate::{CollectorConfig, SpanID};
+use crate::encoding::{now, Encoder, LogFields, MunchError, SpanInfo, StaticKey};
+use crate::{CollectorConfig, LogLevel, SpanID};
+
+/// Wrapper around raw encoded log bytes providing helpful utilities.
+///
+/// This type provides access to the raw log buffer and methods for iterating
+/// over decoded logs or swapping the buffer contents.
+pub struct LogBuffer<'a> {
+    buffer: &'a mut Vec<u8>,
+}
+
+impl<'a> LogBuffer<'a> {
+    /// Create a new LogBuffer wrapping a mutable reference to a Vec.
+    pub fn new(buffer: &'a mut Vec<u8>) -> Self {
+        LogBuffer { buffer }
+    }
+
+    /// Get a reference to the raw bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Get a mutable reference to the raw bytes.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+
+    /// Get the underlying Vec reference.
+    pub fn as_vec(&self) -> &Vec<u8> {
+        self.buffer
+    }
+
+    /// Get a mutable reference to the underlying Vec.
+    pub fn as_vec_mut(&mut self) -> &mut Vec<u8> {
+        self.buffer
+    }
+
+    /// Get the length of the buffer in bytes.
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Check if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Iterate over decoded logs in the buffer.
+    ///
+    /// Each item yields the timestamp, log level, span info, and fields iterator.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = Result<(u64, LogLevel, SpanInfo, LogFields<'_>), MunchError>> + '_
+    {
+        crate::encoding::decode(&self.buffer)
+    }
+
+    /// Swap the internal buffer with another Vec.
+    ///
+    /// This is useful for reusing allocations - swap in an empty or pre-allocated
+    /// Vec and process the returned data.
+    pub fn swap(&mut self, other: &mut Vec<u8>) {
+        std::mem::swap(self.buffer, other);
+    }
+
+    /// Take the buffer contents, leaving an empty Vec in place.
+    ///
+    /// Returns the original buffer contents.
+    pub fn take(&mut self) -> Vec<u8> {
+        std::mem::take(self.buffer)
+    }
+
+    /// Replace the buffer contents with the provided Vec.
+    ///
+    /// Returns the old buffer contents.
+    pub fn replace(&mut self, new: Vec<u8>) -> Vec<u8> {
+        std::mem::replace(self.buffer, new)
+    }
+
+    /// Clear the buffer.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+}
 
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum SyncState {
@@ -469,9 +580,30 @@ fn exit_logger() {
         if let Ok(_) = handle.join() {}
     }
 }
+/// Guard that keeps the log collector running.
+///
+/// When this guard is dropped, the log collector thread is flushed and terminated.
+/// The guard must be held for the entire duration that logging is needed.
+///
+/// # Examples
+///
+/// ```no_run
+/// fn main() {
+///     let _guard = kvlog::collector::init_stdout_logger();
+///
+///     kvlog::info!("Application starting");
+///     // ... application logic ...
+///
+///     // Guard dropped here, collector is flushed and stopped
+/// }
+/// ```
 pub struct LoggerGuard {}
 
 impl LoggerGuard {
+    /// Flushes all pending log messages to their destination.
+    ///
+    /// Blocks until all buffered logs have been written, with a timeout of
+    /// 2 seconds.
     pub fn flush(&self) {
         let mut queue = LOG_WRITER.lock().unwrap();
         if let Some(handle) = &queue.handle {
@@ -588,8 +720,17 @@ fn file_sync_thread(mut file: std::fs::File) {
     }
 }
 
-/// Initializes the global logging collector to output
-/// to stdout
+/// Initializes the log collector to write to stdout.
+///
+/// When stdout is a terminal, logs are formatted with colors and human-readable
+/// timestamps. Otherwise, a plain text format is used.
+///
+/// # Examples
+///
+/// ```no_run
+/// let _guard = kvlog::collector::init_stdout_logger();
+/// kvlog::info!("Hello, world!");
+/// ```
 #[must_use]
 pub fn init_stdout_logger() -> LoggerGuard {
     if std::io::stdout().is_terminal() {
@@ -599,8 +740,20 @@ pub fn init_stdout_logger() -> LoggerGuard {
     }
 }
 
-/// Initializes the global logging collector to output
-/// to the specified file.
+/// Initializes the log collector to append binary logs to a file.
+///
+/// Logs are written in the kvlog binary format. The file is created if it
+/// does not exist.
+///
+/// # Panics
+///
+/// Panics if the file cannot be opened or created.
+///
+/// # Examples
+///
+/// ```no_run
+/// let _guard = kvlog::collector::init_file_logger("/var/log/myapp.kvlog");
+/// ```
 #[must_use]
 pub fn init_file_logger(file: &str) -> LoggerGuard {
     let path = file.to_string();
@@ -615,19 +768,107 @@ pub fn init_file_logger(file: &str) -> LoggerGuard {
     })
 }
 
-/// Initializes the global logging collector to output
-/// to the specified directory.
+/// Initializes the log collector to write to a directory with log rotation.
+///
+/// Logs are written to an `active` file in the directory. When the file
+/// reaches 16 MB, it is rotated to the `archive` subdirectory with a
+/// timestamp-based filename.
+///
+/// # Panics
+///
+/// Panics if the directory cannot be created.
+///
+/// # Examples
+///
+/// ```no_run
+/// let _guard = kvlog::collector::init_directory_logger("/var/log/myapp/");
+/// ```
 #[must_use]
 pub fn init_directory_logger(dir: &str) -> LoggerGuard {
     let dir: PathBuf = Path::new(dir).into();
     init_logger(move || directory_sync_thread(dir))
 }
 
-/// Initializes the global logging collector to output
-/// to the specified directory.
+/// Initializes the log collector with socket fallback to stdout.
+///
+/// Attempts to connect to a Unix socket at the default path. If the socket
+/// is unavailable, falls back to writing formatted logs to stdout.
 #[must_use]
 pub fn init_smart_logger() -> LoggerGuard {
     init_logger(|| hybrid_local_thread(DEFAULT_COLLECTOR_SOCKET_PATH.into(), "".into()))
+}
+
+/// Initializes the global logging collector with a custom closure for processing logs.
+///
+/// The closure receives a [`LogBuffer`] which wraps the raw encoded log bytes and provides
+/// helpful methods for:
+/// - Viewing the raw bytes via [`LogBuffer::as_bytes`]
+/// - Iterating over decoded logs via [`LogBuffer::iter`]
+/// - Swapping out the buffer via [`LogBuffer::swap`], [`LogBuffer::take`], or [`LogBuffer::replace`]
+///
+/// The closure is called each time there are logs to process. The buffer should be
+/// cleared or swapped before returning to avoid processing the same logs again.
+///
+/// # Examples
+///
+/// ```no_run
+/// use kvlog::collector::{init_closure_logger, LogBuffer};
+///
+/// let _guard = init_closure_logger(|buffer: &mut LogBuffer| {
+///     // Process raw bytes
+///     println!("Got {} bytes of logs", buffer.len());
+///
+///     // Or iterate over decoded logs
+///     for log in buffer.iter() {
+///         let (timestamp, level, span_info, fields) = log.unwrap();
+///         println!("{:?} at {}", level, timestamp);
+///     }
+///
+///     // Clear the buffer when done
+///     buffer.clear();
+/// });
+/// ```
+#[must_use]
+pub fn init_closure_logger<F>(handler: F) -> LoggerGuard
+where
+    F: FnMut(&mut LogBuffer) + Send + 'static,
+{
+    init_logger(move || closure_sync_thread(handler))
+}
+
+fn closure_sync_thread<F>(mut handler: F)
+where
+    F: FnMut(&mut LogBuffer),
+{
+    let mut buffer = Vec::<u8>::with_capacity(BUFFER_CAPACITY);
+    let mut wait_flushers = false;
+    loop {
+        let mut queue = LOG_WRITER.lock().unwrap();
+        if queue.sync_state == SyncState::Flushing {
+            wait_flushers = true;
+        }
+        if queue.encoder.buffer.is_empty() {
+            queue.sync_state = SyncState::Waiting;
+            let exiting = queue.exiting;
+            if wait_flushers {
+                wait_flushers = false;
+                FLUSHING.notify_all();
+            }
+            drop(queue);
+            if exiting {
+                return;
+            }
+            std::thread::park();
+            continue;
+        }
+        buffer.clear();
+        std::mem::swap(&mut buffer, &mut queue.encoder.buffer);
+        queue.sync_state = SyncState::Writing;
+        drop(queue);
+
+        let mut log_buffer = LogBuffer::new(&mut buffer);
+        handler(&mut log_buffer);
+    }
 }
 
 fn init_logger(syncfn: impl FnOnce() + Send + 'static) -> LoggerGuard {

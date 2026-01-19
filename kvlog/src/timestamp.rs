@@ -1,5 +1,23 @@
 use std::mem::MaybeUninit;
 
+/// UTC timestamp with nanosecond precision.
+///
+/// Represents a point in time as seconds and nanoseconds since the Unix epoch
+/// (1970-01-01T00:00:00Z). Supports timestamps before the epoch using negative
+/// seconds values.
+///
+/// # Examples
+///
+/// ```
+/// use kvlog::Timestamp;
+///
+/// // Create from milliseconds since Unix epoch
+/// let ts = Timestamp::from_millisecond(1705670400000);
+///
+/// // Access components
+/// let secs = ts.seconds();
+/// let nanos = ts.subsec_nanos();
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp {
     pub(crate) seconds: i64,
@@ -95,12 +113,23 @@ impl Timestamp {
             new_len
         }
     }
+    /// Returns the sub-second component in nanoseconds.
+    ///
+    /// The returned value is always in the range `0..1_000_000_000`.
     pub fn subsec_nanos(&self) -> u32 {
         self.nanos
     }
+
+    /// Returns the number of whole seconds since the Unix epoch.
+    ///
+    /// Negative values represent timestamps before the epoch.
     pub fn seconds(&self) -> i64 {
         self.seconds
     }
+
+    /// Creates a new timestamp, clamping nanoseconds to valid range.
+    ///
+    /// If `nanos` exceeds 999,999,999 it is clamped to that maximum value.
     pub fn new_clamped(seconds: i64, nanos: u32) -> Timestamp {
         let mut nanos = nanos;
         if nanos > 999_999_999 {
@@ -108,7 +137,10 @@ impl Timestamp {
         }
         Timestamp { seconds, nanos }
     }
-    /// From a UNIX Epoch in milliseconds
+
+    /// Creates a timestamp from milliseconds since the Unix epoch.
+    ///
+    /// Negative values represent timestamps before the epoch.
     pub fn from_millisecond(millisecond: i64) -> Timestamp {
         let seconds = millisecond.div_euclid(1000);
         let nanos = millisecond.rem_euclid(1000) * 1_000_000;
@@ -117,6 +149,10 @@ impl Timestamp {
             nanos: nanos as u32,
         }
     }
+
+    /// Converts this timestamp to milliseconds since the Unix epoch.
+    ///
+    /// Uses saturating arithmetic to avoid overflow.
     pub fn as_millisecond_clamped(&self) -> i64 {
         self.seconds.saturating_mul(1000) + (self.nanos / 1_000_000) as i64
     }

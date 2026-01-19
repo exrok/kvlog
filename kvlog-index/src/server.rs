@@ -51,12 +51,7 @@ struct StreamingDechunker {
 
 impl StreamingDechunker {
     fn new() -> Self {
-        Self {
-            buffer: vec![0; DEFAULT_BUFFER_SIZE],
-            head: 0,
-            tail: 0,
-            state: DechunkState::AwaitingChunkHeader,
-        }
+        Self { buffer: vec![0; DEFAULT_BUFFER_SIZE], head: 0, tail: 0, state: DechunkState::AwaitingChunkHeader }
     }
 
     fn buffered_len(&self) -> usize {
@@ -204,7 +199,6 @@ impl StreamingDechunker {
     }
 }
 
-// "/tmp/libra-server.sock"
 pub fn block_on(unix_socket_path: &Path, index: &mut Index, on_update: &mut dyn FnMut()) -> io::Result<()> {
     let _ = std::fs::remove_file(unix_socket_path);
     let listener = UnixListener::bind(unix_socket_path)?;
@@ -212,9 +206,9 @@ pub fn block_on(unix_socket_path: &Path, index: &mut Index, on_update: &mut dyn 
     run_server(listener, server)
 }
 
-struct Server<'a> {
-    index: &'a mut Index,
-    update_signal: &'a mut dyn FnMut(),
+pub struct Server<'a> {
+    pub index: &'a mut Index,
+    pub update_signal: &'a mut dyn FnMut(),
 }
 
 struct Connection {
@@ -265,7 +259,7 @@ fn next(current: &mut Token) -> Token {
     Token(next)
 }
 
-fn run_server(mut listener: UnixListener, server: Server) -> io::Result<()> {
+pub fn run_server(mut listener: UnixListener, server: Server) -> io::Result<()> {
     // Create a poll instance.
     let poll = mio::Poll::new()?;
     // Create storage for events.
