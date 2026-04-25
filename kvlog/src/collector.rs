@@ -95,9 +95,6 @@ impl<'a> LogBuffer<'a> {
     }
 
     /// Swap the internal buffer with another Vec.
-    ///
-    /// This is useful for reusing allocations - swap in an empty or pre-allocated
-    /// Vec and process the returned data.
     pub fn swap(&mut self, other: &mut Vec<u8>) {
         std::mem::swap(self.buffer, other);
     }
@@ -129,6 +126,32 @@ pub enum SyncState {
     Waiting,
 }
 
+/// Policy controlling what happens to log messages emitted before a collector
+/// has been initialized via one of the `init_*_logger` functions.
+///
+/// The default is [`UninitializedLogPolicy::Stdout`], which preserves the
+/// historical behaviour of pretty-printing pre-initialization logs to stdout
+/// (useful for tests run with `cargo test -- --nocapture`).
+///
+/// Use [`set_uninitialized_log_policy`] to change the active policy. Once a
+/// collector is initialized, this policy no longer applies as logs flow to the
+/// collector instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninitializedLogPolicy {
+    /// Pretty-print pending logs to stdout, then drop them. Default.
+    Stdout,
+    /// Pretty-print pending logs to stderr, then drop them.
+    Stderr,
+    /// Retain logs in the in-memory buffer. Once the buffer grows beyond
+    /// `max_bytes`, it is cleared (oldest logs are dropped).
+    ///
+    /// If a collector is later initialized while logs are still buffered,
+    /// those buffered logs will be picked up by the new collector.
+    Buffer { max_bytes: usize },
+    /// Drop logs immediately without producing any output.
+    Discard,
+}
+
 #[allow(unused)]
 pub struct LogQueue {
     pub encoder: Encoder,
@@ -137,14 +160,13 @@ pub struct LogQueue {
     pub exiting: bool,
     pub handle: Option<thread::JoinHandle<()>>,
     pub parent_table: Option<Box<ParentSpanSuffixCache>>,
+    pub uninitialized_policy: UninitializedLogPolicy,
 }
 
 impl LogQueue {
-    pub fn poke(&mut self) {
-        if self.sync_state != SyncState::Writing {
-            if let Some(handle) = &self.handle {
-                handle.thread().unpark();
-            } else {
+    fn handle_uninitialized_update(&mut self) {
+        match self.uninitialized_policy {
+            UninitializedLogPolicy::Stdout => {
                 let parent_table = self
                     .parent_table
                     .get_or_insert_with(|| ParentSpanSuffixCache::new_boxed());
@@ -154,7 +176,58 @@ impl LogQueue {
                 );
                 self.encoder.buffer.clear();
             }
+            UninitializedLogPolicy::Stderr => {
+                let parent_table = self
+                    .parent_table
+                    .get_or_insert_with(|| ParentSpanSuffixCache::new_boxed());
+                eprint!(
+                    "{}",
+                    pretty_print_buffer(&mut self.logfmt, &mut *parent_table, &self.encoder.buffer)
+                );
+                self.encoder.buffer.clear();
+            }
+            UninitializedLogPolicy::Buffer { max_bytes } => {
+                if self.encoder.buffer.len() > max_bytes {
+                    self.encoder.buffer.clear();
+                }
+            }
+            UninitializedLogPolicy::Discard => {
+                self.encoder.buffer.clear();
+            }
         }
+    }
+
+    pub fn poke(&mut self) {
+        if self.sync_state == SyncState::Writing {
+            return;
+        }
+        if let Some(handle) = &self.handle {
+            handle.thread().unpark();
+            return;
+        }
+
+        self.handle_uninitialized_update();
+    }
+}
+
+/// Sets the policy applied to log messages emitted before a collector is
+/// initialized.
+///
+/// See [`UninitializedLogPolicy`] for the available policies. The default is
+/// [`UninitializedLogPolicy::Stdout`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use kvlog::collector::{set_uninitialized_log_policy, UninitializedLogPolicy};
+///
+/// // Drop logs emitted before a collector is wired up.
+/// set_uninitialized_log_policy(UninitializedLogPolicy::Discard);
+/// ```
+pub fn set_uninitialized_log_policy(policy: UninitializedLogPolicy) {
+    match LOG_WRITER.lock() {
+        Ok(mut queue) => queue.uninitialized_policy = policy,
+        Err(poisoned) => poisoned.into_inner().uninitialized_policy = policy,
     }
 }
 
@@ -167,6 +240,7 @@ pub static LOG_WRITER: Mutex<LogQueue> = Mutex::new(LogQueue {
     exiting: false,
     handle: None,
     parent_table: None,
+    uninitialized_policy: UninitializedLogPolicy::Stdout,
 });
 
 const BUFFER_CAPACITY: usize = 4096;

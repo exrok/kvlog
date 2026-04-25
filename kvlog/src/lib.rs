@@ -149,8 +149,8 @@ use std::{
     sync::{atomic::AtomicU64, MutexGuard as StdMutexGuard},
 };
 
-use collector::{LogQueue, LoggerGuard};
 pub use collector::LogBuffer;
+use collector::{LogQueue, LoggerGuard};
 pub use encoding::BStr;
 pub use encoding::{Encode, SpanInfo, ValueEncoder};
 mod mutex;
