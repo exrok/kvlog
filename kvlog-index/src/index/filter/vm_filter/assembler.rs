@@ -283,6 +283,9 @@ impl<'a> Assembler<'a> {
     }
 
     pub(crate) fn build(mut self) -> Result<QueryVm<'a>, VmCompileError> {
+        if self.key_map.len() > 8 {
+            return Err(VmCompileError::TooManyFieldKeys);
+        }
         for (offset, label) in &self.label_use_offsets {
             let ptr = self.code.as_mut_ptr().cast::<u16>();
         }

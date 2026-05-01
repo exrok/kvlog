@@ -8,12 +8,22 @@ use hashbrown::HashTable;
 
 use crate::index::InternedRange;
 
+const MAX_INTERNED_TARGETS: usize = u16::MAX as usize + 1;
+
 #[derive(Default)]
 pub struct LocalIntermentCache {
     cache: HashTable<InternedRange>,
 }
 impl LocalIntermentCache {
-    pub fn intern(&mut self, buf: &SharedIntermentBuffer, value: &[u8]) -> u16 {
+    /// Intern a target name. Returns `None` if the underlying shared buffer
+    /// is exhausted (cardinality cap, value too large, or backing storage
+    /// full). Callers must drop the offending record rather than panic.
+    pub fn intern(&mut self, buf: &SharedIntermentBuffer, mut value: &[u8]) -> Option<u16> {
+        if let Err(err) = std::str::from_utf8(value) {
+            let valid_up_to = err.valid_up_to();
+            kvlog::error!("Invalid UTF8 Target", ?err);
+            value = &value[..valid_up_to];
+        }
         let hash = buf.hasher.hash_one(value);
         let map = self.cache.entry(
             hash,
@@ -21,11 +31,11 @@ impl LocalIntermentCache {
             |v| buf.hasher.hash_one(unsafe { buf.bytes_unchecked(*v) }),
         );
         match map {
-            hashbrown::hash_table::Entry::Occupied(entry) => entry.get().data,
+            hashbrown::hash_table::Entry::Occupied(entry) => Some(entry.get().data),
             hashbrown::hash_table::Entry::Vacant(entry) => {
-                let range = buf.insert_precached(hash, value);
+                let range = buf.insert_precached(hash, value)?;
                 entry.insert(range);
-                range.data
+                Some(range.data)
             }
         }
     }
@@ -59,7 +69,7 @@ impl SharedIntermentBuffer {
             NonNull::new(std::alloc::alloc(std::alloc::Layout::from_size_align(data_capacity, 1).unwrap())).unwrap()
         };
         let slices = unsafe {
-            NonNull::new(std::alloc::alloc(std::alloc::Layout::array::<InternedRange>(u16::MAX as usize).unwrap())
+            NonNull::new(std::alloc::alloc(std::alloc::Layout::array::<InternedRange>(MAX_INTERNED_TARGETS).unwrap())
                 as *mut InternedRange)
             .unwrap()
         };
@@ -72,32 +82,41 @@ impl SharedIntermentBuffer {
             len: AtomicUsize::new(0),
         }
     }
-    fn insert_precached(&self, hash: u64, value: &[u8]) -> InternedRange {
+    /// Insert a precomputed-hashed value into the buffer.
+    ///
+    /// Returns `None` (instead of panicking) when:
+    /// - the unique target count would exceed `MAX_INTERNED_TARGETS`
+    /// - the value length exceeds `u16::MAX`
+    /// - the backing byte buffer is full
+    ///
+    /// The first failure of each kind logs at error level.
+    fn insert_precached(&self, hash: u64, value: &[u8]) -> Option<InternedRange> {
         let mut inner = self.lut.lock().unwrap();
         let inner: &mut InnerBuffer = &mut *inner;
-        let id = inner.lookup.len() as u16;
+        let id = inner.lookup.len();
         let map = inner.lookup.entry(
             hash,
             |v| value == unsafe { self.bytes_unchecked(*v) },
             |v| self.hasher.hash_one(unsafe { self.bytes_unchecked(*v) }),
         );
         match map {
-            hashbrown::hash_table::Entry::Occupied(entry) => return *entry.get(),
+            hashbrown::hash_table::Entry::Occupied(entry) => return Some(*entry.get()),
             hashbrown::hash_table::Entry::Vacant(entry) => {
-                if let Err(err) = std::str::from_utf8(value) {
-                    // should generally not happen expect bad performacne
-                    // we assume this want happen
-                    let ve = err.valid_up_to();
-                    kvlog::error!("Invalid UTF8 Target", ?err);
-                    let truncated = &value[..ve];
-                    let hash = self.hasher.hash_one(truncated);
-                    return self.insert_precached(hash, truncated);
+                if id >= MAX_INTERNED_TARGETS {
+                    kvlog::error!("Interment cache target count exceeded; dropping target", id);
+                    return None;
                 }
-                if (value.len() > (u16::MAX as usize)) {
-                    panic!("Value exeeced max size")
+                if value.len() > (u16::MAX as usize) {
+                    kvlog::error!("Interment cache value exceeded max size; dropping target", value_len = value.len());
+                    return None;
                 }
                 if inner.written + value.len() > self.data_capacity {
-                    panic!("Interment Cache Buffer Size Exceeded")
+                    kvlog::error!(
+                        "Interment cache buffer size exceeded; dropping target",
+                        written = inner.written,
+                        value_len = value.len()
+                    );
+                    return None;
                 }
                 let start = inner.written;
                 unsafe {
@@ -105,13 +124,13 @@ impl SharedIntermentBuffer {
                 }
                 inner.written += value.len();
                 let len = value.len() as u16;
-                let range = InternedRange { data: id, offset: start as u32, len };
+                let range = InternedRange { data: id as u16, offset: start as u32, len };
                 entry.insert(range);
                 unsafe {
                     self.slices.as_ptr().add(id as usize).write(range);
                 }
                 self.len.fetch_add(1, std::sync::atomic::Ordering::Release);
-                return range;
+                return Some(range);
             }
         }
     }

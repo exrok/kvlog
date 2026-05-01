@@ -66,9 +66,14 @@ impl KeySet {
                 Err(_) => {
                     let mut hash_set = HashSet::with_capacity(16);
                     for item in inline_set.iter() {
-                        hash_set.insert_unique_unchecked(item.0);
+                        unsafe {
+                            hash_set.insert_unique_unchecked(item.0);
+                        }
                     }
-                    hash_set.insert_unique_unchecked(key.0);
+                    unsafe {
+                        hash_set.insert_unique_unchecked(key.0);
+                    }
+
                     *self = KeySet::Alloc(hash_set);
                     true
                 }

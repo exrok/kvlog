@@ -1,5 +1,4 @@
 use crate::{
-    bloom::{BloomBuilder, BloomLine},
     field_table::{KeyID, KeyMap},
     query::{query_parts::FieldKey, QueryExpr},
     shared_interner::{LocalIntermentCache, SharedIntermentBuffer},
@@ -7,17 +6,19 @@ use crate::{
 use ahash::RandomState;
 use archetype::ServiceId;
 use core::time;
-use f48::{f48_to_f64, f64_to_f48, F48};
+use f60::{f60_to_f64, f64_to_f60, F60};
 pub use filter::{EntryCollection, Query};
 use hashbrown::HashTable;
 use hashbrown::{HashMap, HashSet};
 use jsony::Jsony;
-pub mod f48;
+use smallvec::SmallVec;
+pub mod f60;
 use kvlog::{
     encoding::{Key, LogFields, MunchError, SpanInfo, StaticKey, Value},
     LogLevel, SpanID,
 };
 use std::{
+    collections::VecDeque,
     fmt::Write,
     os::raw::c_void,
     ptr::NonNull,
@@ -25,8 +26,12 @@ use std::{
         atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+
+use crate::persistence::encoder::{self as stream_encoder, BucketLogStreamEncoder};
+use crate::persistence::{DrainedLogBuffer, IndexConfig};
 pub mod archetype;
 pub use archetype::Archetype;
 
@@ -37,6 +42,10 @@ use self::filter::{ForwardQueryWalker, ForwardSegmentWalker, QueryStrategy};
 pub use self::filter::{GeneralFilter, GeneralQuery, ReverseQueryWalker, SpanCache, TimeFilter};
 pub mod filter;
 mod table_bucket;
+pub use table_bucket::{
+    BucketSnapshotScratch, BucketSnapshotSlices, GlobalInternError, LoadedBucket, PersistentInterners,
+    SnapshotLoadError, SnapshotWriteError, ValidationMode,
+};
 // use libc::MADV_HUGEPAGE;
 
 #[derive(Default, Debug, Clone)]
@@ -83,6 +92,9 @@ pub struct Field {
     pub(crate) raw: u64,
 }
 
+const FIELD_VALUE_MASK: u64 = (1u64 << 60) - 1;
+const _: () = assert!(std::mem::size_of::<Field>() == 8);
+
 #[derive(Debug, Jsony, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 #[jsony(ToStr)]
@@ -90,10 +102,10 @@ pub enum FieldKind {
     None = 0,
     String = 1,
     Bytes = 2,
-    I48 = 3,
+    I60 = 3,
     I64 = 4,
     U64 = 5,
-    F48 = 6,
+    F60 = 6,
     Bool = 7,
     UUID = 8,
     Seconds = 9,
@@ -107,29 +119,15 @@ pub enum FieldKind {
 
 impl Field {
     pub(crate) fn kind(&self) -> FieldKind {
-        unsafe { std::mem::transmute(((self.raw >> 48) as u8) & 0xf) }
+        unsafe { std::mem::transmute(((self.raw >> 60) as u8) & 0xf) }
     }
 
-    pub fn new(key: u16, kind: FieldKind, value_mask: u64) -> Field {
-        Field { raw: ((key as u64) << 52) | ((kind as u64) << 48) | value_mask }
+    pub fn new(kind: FieldKind, value_mask: u64) -> Field {
+        debug_assert_eq!(value_mask & !FIELD_VALUE_MASK, 0);
+        Field { raw: ((kind as u64) << 60) | value_mask }
     }
-    pub fn key_mask(&self) -> u64 {
-        self.raw & !((1u64 << 48) - 1)
-    }
-    pub fn raw_key(&self) -> u16 {
-        (self.raw >> 52) as u16
-    }
-    fn value_mask(&self) -> u64 {
-        self.raw & ((1u64 << 48) - 1)
-    }
-    // fn max_field_bits_with_key(key: KeyID) -> u64 {
-    //     ((key.raw() as u64) << 52) | (0xFFFF_FFFF_FFFF_FFFF >> (64 - 52))
-    // }
-    // fn static_key(self) -> Option<StaticKey> {
-    //     StaticKey::from_u8(self.key_mask().try_into().ok()?)
-    // }
-    unsafe fn key(self) -> KeyID {
-        unsafe { KeyID::new(self.raw_key()) }
+    pub(crate) fn value_mask(&self) -> u64 {
+        self.raw & FIELD_VALUE_MASK
     }
     pub(crate) unsafe fn as_f64<'a>(self, bucket: &'a Bucket) -> Option<f64> {
         match self.value(bucket) {
@@ -185,7 +183,7 @@ impl Field {
             _ => None,
         }
     }
-    pub(crate) fn as_raw_f48_seconds<'a>(self) -> Option<F48> {
+    pub(crate) fn as_raw_f60_seconds<'a>(self) -> Option<F60> {
         match self.kind() {
             FieldKind::Seconds => Some(self.value_mask()),
             _ => None,
@@ -201,7 +199,7 @@ impl Field {
                 let range = InternedRange::from_field_mask(self.value_mask());
                 Value::Bytes(unsafe { bucket.data_unchecked(range) })
             }
-            FieldKind::I48 => Value::I64(i48::to_i64(self.value_mask())),
+            FieldKind::I60 => Value::I64(i60::to_i64(self.value_mask())),
             FieldKind::I64 => {
                 let value = unsafe { bucket.u64_unchecked(self.value_mask() as u32) };
                 Value::I64(value as i64)
@@ -210,8 +208,8 @@ impl Field {
                 let value = unsafe { bucket.u64_unchecked(self.value_mask() as u32) };
                 Value::U64(value as u64)
             }
-            FieldKind::F48 => Value::F64(f48_to_f64(self.value_mask())),
-            FieldKind::Seconds => Value::Seconds(f48_to_f64(self.value_mask()) as f32),
+            FieldKind::F60 => Value::F64(f60_to_f64(self.value_mask())),
+            FieldKind::Seconds => Value::Seconds(f60_to_f64(self.value_mask()) as f32),
             FieldKind::UUID => {
                 Value::UUID(uuid::Uuid::from_bytes(unsafe { *bucket.uuid_bytes(self.value_mask() as u32) }))
             }
@@ -230,40 +228,35 @@ impl std::fmt::Debug for Field {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.kind().to_str())?;
         f.write_char('(');
-        if let Some(key) = KeyID::try_raw_to_str(self.raw_key()) {
-            f.write_str(key)?;
-        } else {
-            self.raw_key().fmt(f)?;
-        }
         match self.kind() {
             FieldKind::String | FieldKind::Bytes => {
                 let range = InternedRange::from_field_mask(self.value_mask());
-                write!(f, ", {{len: {}, offset: {}}}", range.len, range.offset)?;
+                write!(f, "{{len: {}, offset: {}}}", range.len, range.offset)?;
             }
-            FieldKind::I48 => {
-                write!(f, ", {}", i48::to_i64(self.value_mask()))?;
+            FieldKind::I60 => {
+                write!(f, "{}", i60::to_i64(self.value_mask()))?;
             }
             FieldKind::I64 => {
-                write!(f, ", {{offset: {}}}", self.value_mask())?;
+                write!(f, "{{offset: {}}}", self.value_mask())?;
             }
             FieldKind::U64 => {
-                write!(f, ", {{offset: {}}}", self.value_mask())?;
+                write!(f, "{{offset: {}}}", self.value_mask())?;
             }
-            FieldKind::F48 => {
-                write!(f, ", {}", f48::f48_to_f64(self.value_mask()))?;
+            FieldKind::F60 => {
+                write!(f, "{}", f60::f60_to_f64(self.value_mask()))?;
             }
             FieldKind::Bool => {
-                write!(f, ", {}", (self.value_mask() as u8) != 0)?;
+                write!(f, "{}", (self.value_mask() as u8) != 0)?;
             }
             FieldKind::UUID => {
-                write!(f, ", {}", self.value_mask() as u32)?;
+                write!(f, "{}", self.value_mask() as u32)?;
             }
             FieldKind::Seconds => {
-                write!(f, ", {}", f48::f48_to_f64(self.value_mask()))?;
+                write!(f, "{}", f60::f60_to_f64(self.value_mask()))?;
             }
             FieldKind::Timestamp => {
                 let time = kvlog::Timestamp::from_millisecond(self.value_mask() as i64);
-                write!(f, ", {:?}", time)?;
+                write!(f, "{:?}", time)?;
             }
             _ => {}
         }
@@ -276,6 +269,23 @@ impl From<u8> for FieldKind {
         unsafe { std::mem::transmute(value & 0xf) }
     }
 }
+
+fn sort_fields_by_key(fields: &mut [Field], keys: &mut [u16]) {
+    debug_assert_eq!(fields.len(), keys.len());
+    for i in 1..fields.len() {
+        let key = keys[i];
+        let field = fields[i];
+        let mut j = i;
+        while j > 0 && (keys[j - 1] > key || (keys[j - 1] == key && fields[j - 1].raw > field.raw)) {
+            keys[j] = keys[j - 1];
+            fields[j] = fields[j - 1];
+            j -= 1;
+        }
+        keys[j] = key;
+        fields[j] = field;
+    }
+}
+
 // Current settings targets around ~1GB memory of RAM
 // To hold around a million logs, per bucket
 // todo make these runtime configurable
@@ -290,6 +300,18 @@ const BUCKET_COUNT: usize = 4;
 const TIME_RANGE_LOG_COUNT: usize = 4096;
 const TIME_RANGE_LOG_MASK_SIZE: u32 = TIME_RANGE_LOG_COUNT.trailing_zeros();
 const BUCKET_ARCHETYPE_SIZE: usize = u16::MAX as usize;
+
+/// Initial capacity reserved for a freshly-allocated active log buffer when
+/// persistence is enabled. The caller is expected to swap in a larger
+/// pre-sized buffer via [`Index::swap_log_buffer`].
+const BUCKET_LOG_BUFFER_INITIAL_CAPACITY: usize = 4 * 1024;
+
+/// Current wall-clock time in nanoseconds since the Unix epoch. Used to stamp
+/// the close timestamp into a finalized log buffer. Returns 0 if the system
+/// clock is set before the epoch.
+fn system_time_now_ns() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
 
 #[derive(Debug)]
 #[repr(C)]
@@ -341,6 +363,50 @@ impl IntermentMaps {
     pub fn keys(&self) -> impl Iterator<Item = (KeyID, &KeyInfo)> + '_ {
         self.keys.iter().filter(|(_, info)| info.total > 0)
     }
+    fn index_field_value(&mut self, bucket: &Bucket, field: Field) {
+        match field.kind() {
+            FieldKind::String | FieldKind::Bytes => {
+                let range = InternedRange::from_field_mask(field.value_mask());
+                if range.len == 0 && range.offset == 0 {
+                    return;
+                }
+                let hash = bucket.random_state.hash_one(unsafe { bucket.data_unchecked(range) });
+                let entry = self.general.entry(
+                    hash,
+                    |existing| same_range(*existing, range),
+                    |existing| bucket.random_state.hash_one(unsafe { bucket.data_unchecked(*existing) }),
+                );
+                if let hashbrown::hash_table::Entry::Vacant(entry) = entry {
+                    entry.insert(range);
+                }
+            }
+            FieldKind::I64 | FieldKind::U64 => {
+                let range = InternedRange { offset: field.value_mask() as u32, data: 0, len: 8 };
+                let hash = bucket.random_state.hash_one(unsafe { bucket.data_unchecked(range) });
+                let entry = self.general.entry(
+                    hash,
+                    |existing| same_range(*existing, range),
+                    |existing| bucket.random_state.hash_one(unsafe { bucket.data_unchecked(*existing) }),
+                );
+                if let hashbrown::hash_table::Entry::Vacant(entry) = entry {
+                    entry.insert(range);
+                }
+            }
+            FieldKind::UUID => {
+                let offset = field.value_mask() as u32;
+                let hash = bucket.random_state.hash_one(unsafe { bucket.uuid_bytes(offset) });
+                let entry = self.uuid.entry(
+                    hash,
+                    |existing| *existing == offset,
+                    |existing| bucket.random_state.hash_one(unsafe { bucket.uuid_bytes(*existing) }),
+                );
+                if let hashbrown::hash_table::Entry::Vacant(entry) = entry {
+                    entry.insert(offset);
+                }
+            }
+            _ => {}
+        }
+    }
     pub fn field_u64(&self, bucket: &BucketGuard, key: KeyID, value: u64) -> Option<Field> {
         if let Ok(signed) = i64::try_from(value) {
             return self.field_i64(bucket, key, signed);
@@ -349,32 +415,32 @@ impl IntermentMaps {
         let hash = bucket.bucket.random_state.hash_one(value);
         let range = *self.general.find(hash, |t| unsafe { bucket.bucket.data_unchecked(*t) == value })?;
         let (kind, mask) = (FieldKind::U64, range.field_mask());
-        let field = Field::new(key.raw(), kind, mask);
+        let field = Field::new(kind, mask);
         Some(field)
     }
     pub fn field_i64(&self, bucket: &BucketGuard, key: KeyID, value: i64) -> Option<Field> {
-        let (kind, mask) = if let Some(value) = i48::try_from_i64(value) {
-            (FieldKind::I48, value)
+        let (kind, mask) = if let Some(value) = i60::try_from_i64(value) {
+            (FieldKind::I60, value)
         } else {
             let value = &value.to_ne_bytes();
             let hash = bucket.bucket.random_state.hash_one(value);
             let range = *self.general.find(hash, |t| unsafe { bucket.bucket.data_unchecked(*t) == value })?;
             (FieldKind::I64, range.field_mask())
         };
-        let field = Field::new(key.raw(), kind, mask);
+        let field = Field::new(kind, mask);
         Some(field)
     }
     pub fn field_text(&self, bucket: &BucketGuard, key: KeyID, value: &[u8]) -> Option<Field> {
         let hash = bucket.bucket.random_state.hash_one(value);
         let index = *self.general.find(hash, |t| unsafe { bucket.bucket.data_unchecked(*t) == value })?;
-        let field = Field::new(key.raw(), FieldKind::String, index.field_mask());
+        let field = Field::new(FieldKind::String, index.field_mask());
         Some(field)
     }
     pub fn field_uuid(&self, bucket: &BucketGuard, key: KeyID, value: Uuid) -> Option<Field> {
         let index = *self.uuid.find(bucket.bucket.random_state.hash_one(value.as_bytes()), |t| unsafe {
             bucket.bucket.uuid_bytes(*t) == value.as_bytes()
         })?;
-        Some(Field::new(key.raw(), FieldKind::UUID, index as u64))
+        Some(Field::new(FieldKind::UUID, index as u64))
     }
 }
 
@@ -383,26 +449,27 @@ pub struct WeakLogEntry {
     pub(crate) index: u32,
     bucket_generation: u32,
 }
-// const BUCKET_LOG_SIZE: usize = 511;
-// const BUCKET_FIELD_SIZE: usize = 8 * (BUCKET_LOG_SIZE + 1);
-// const BUCKET_DATA_SIZE: usize = BUCKET_LOG_SIZE * 256;
-// const BUCKET_COUNT: usize = 4;
+
+impl WeakLogEntry {
+    pub fn new(bucket_generation: u32, index: u32) -> WeakLogEntry {
+        WeakLogEntry { index, bucket_generation }
+    }
+    pub fn bucket_generation(&self) -> u32 {
+        self.bucket_generation
+    }
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
 pub struct Bucket {
     generation: AtomicU32,
     intern_map: Mutex<IntermentMaps>,
     data: NonNull<u8>,
-    random_state: RandomState,
+    pub(crate) random_state: RandomState,
     field: NonNull<Field>,
-    bloom: NonNull<BloomLine>,
 
     timerange: NonNull<TimeRange>,
-
-    // // stores the message field, max 2^16 disinct per bucket
-    // msg: NonNull<u16>,
-    // msg_ptr: NonNull<InternedRange>,
-
-    // stores the target field, max 2^16 disinct per bucket
-    target: NonNull<u16>,
 
     span_index: NonNull<u32>,
     span_data: NonNull<SpanRange>,
@@ -426,6 +493,7 @@ pub struct LogEntry<'a> {
 #[derive(Clone)]
 pub struct Fields<'a> {
     fields: &'a [Field],
+    keys: &'a [KeyID],
     bucket: &'a Bucket,
 }
 
@@ -440,52 +508,14 @@ impl<'a> Iterator for Fields<'a> {
         let [field, rest @ ..] = self.fields else {
             return None;
         };
+        let [key, rest_keys @ ..] = self.keys else {
+            return None;
+        };
         self.fields = rest;
-        Some(unsafe { (field.key(), field.value(self.bucket)) })
+        self.keys = rest_keys;
+        Some(unsafe { (*key, field.value(self.bucket)) })
     }
 }
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn index_of_simd_single_match(data_u64: &[u64; 2], value_to_find: u16) -> Option<u32> {
-    use core::arch::x86_64::*;
-
-    // Cast the pointer from &[u64; 2] (16 bytes, 8-byte aligned) to *const __m128i.
-    // _mm_loadu_si128 handles potentially unaligned (relative to 16 bytes) sources.
-    let data_ptr = data_u64.as_ptr() as *const __m128i;
-    let simd_data: __m128i = _mm_loadu_si128(data_ptr); // SSE2
-
-    // Splat the value_to_find into a 128-bit vector.
-    // Each of the 8 u16 lanes in simd_value will hold value_to_find.
-    // The cast to i16 is conventional for epi16 intrinsics; it refers to the bit pattern.
-    let simd_value: __m128i = _mm_set1_epi16(value_to_find as i16); // SSE2
-
-    // Perform a packed 16-bit equality comparison.
-    // Each u16 lane in cmp_result will be 0xFFFF if data[lane] == value_to_find,
-    // or 0x0000 otherwise.
-    let cmp_result: __m128i = _mm_cmpeq_epi16(simd_data, simd_value); // SSE2
-
-    // Create a bitmask from the most significant bit of each 8-bit element in cmp_result.
-    // If data[i] (a u16) matches, then the two bytes for that u16 in cmp_result are 0xFF.
-    // So, bits 2*i and 2*i+1 in 'mask' will be 1.
-    // The result is an i32, but only the lower 16 bits are relevant.
-    let mask: i32 = _mm_movemask_epi8(cmp_result); // SSE2
-
-    if mask == 0 {
-        // No elements matched.
-        None
-    } else {
-        // At least one element matched. Since there's at most one match,
-        // exactly one u16 element matched, setting a unique pair of bits in the mask.
-        // _tzcnt_u32 counts trailing zeros to find the index of the LSB.
-        // If data[0] matched, mask is ~0b...0011, _tzcnt_u32 -> 0. Index = 0/2 = 0.
-        // If data[1] matched, mask is ~0b...1100, _tzcnt_u32 -> 2. Index = 2/2 = 1.
-        // tzcnt is a BMI1 instruction.
-        let lsb_bit_index: u32 = _tzcnt_u32(mask as u32);
-        // The u16 element index is half the bit index.
-        Some((lsb_bit_index / 2))
-    }
-}
-
 impl<'a> LogEntry<'a> {
     pub fn weak(&self) -> WeakLogEntry {
         WeakLogEntry { index: self.index as u32, bucket_generation: self.bucket.generation.load(Ordering::Relaxed) }
@@ -493,17 +523,11 @@ impl<'a> LogEntry<'a> {
     pub fn bucket(&self) -> &Bucket {
         self.bucket
     }
-    pub fn bloom(&self) -> &BloomLine {
-        unsafe { &*self.bucket.bloom.as_ptr().add(self.index as usize) }
-    }
     pub fn timestamp(&self) -> u64 {
         unsafe { *self.bucket.timestamp.as_ptr().add(self.index as usize) }
     }
-    // pub fn message_id(&self) -> u16 {
-    //     unsafe { *self.bucket.msg.as_ptr().add(self.index) }
-    // }
     pub fn target_id(&self) -> u16 {
-        unsafe { *self.bucket.target.as_ptr().add(self.index as usize) }
+        self.archetype().target_id
     }
     pub fn archetype(&self) -> &archetype::Archetype {
         unsafe { self.bucket.archetype(*self.bucket.archetype_index.as_ptr().add(self.index as usize)) }
@@ -513,17 +537,14 @@ impl<'a> LogEntry<'a> {
         let intern_range = InternedRange { offset: archetype.msg_offset, data: 0, len: archetype.msg_len };
         unsafe { self.bucket.data_unchecked(intern_range) }
     }
-    pub fn raw_bloom(&self) -> u8 {
-        self.bloom().0
-    }
     pub fn raw_archetype(&self) -> u16 {
         unsafe { *self.bucket.archetype_index.as_ptr().add(self.index as usize) }
     }
     pub fn level_mask(&self) -> u8 {
-        self.raw_bloom() & 0xf
+        self.archetype().mask as u8 & 0xf
     }
     pub fn level(&self) -> LogLevel {
-        self.bloom().level()
+        self.archetype().level()
     }
     pub fn field_by_dyn_key(&self, key: FieldKey) -> Option<Field> {
         match key {
@@ -532,51 +553,11 @@ impl<'a> LogEntry<'a> {
         }
     }
     pub fn field_by_key_name(&self, name: &str) -> Option<Field> {
-        for field in self.raw_fields() {
-            if unsafe { field.key().as_str() } == name {
-                return Some(*field);
-            }
-        }
-        None
+        self.field_by_key_id(KeyID::try_from_str(name)?)
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse2", target_feature = "bmi2"))]
     pub fn field_by_key_id(&self, key: KeyID) -> Option<Field> {
-        let arch = self.archetype();
-
-        let index =
-            unsafe { index_of_simd_single_match(&*(&arch.field_headers as *const _ as *const [u64; 2]), key.raw()) };
-        if let Some(index) = index {
-            return unsafe { Some(*self.get_field_unchecked(index as usize)) };
-        }
-
-        for (i, header) in arch.field_keys().iter().skip(8).enumerate() {
-            if *header == key {
-                return unsafe { Some(*self.get_field_unchecked(i)) };
-            }
-        }
-        None
-        // let mask = (index.0 as u64) << 52;
-        // for field in self.raw_fields() {
-        //     if field.raw < mask {
-        //         continue;
-        //     }
-        //     if field.raw ^ mask < ((1u64 << 53) - 1) {
-        //         return Some(*field);
-        //     }
-        //     return None;
-        // }
-        // return None;
-    }
-
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2", target_feature = "bmi2")))]
-    pub fn field_by_key_id(&self, key: KeyID) -> Option<Field> {
-        let arch = self.archetype();
-        for (i, header) in arch.field_keys().iter().enumerate() {
-            if *header == key {
-                return unsafe { Some(*self.get_field_unchecked(i)) };
-            }
-        }
-        None
+        let index = self.archetype().index_of(key)?;
+        unsafe { Some(*self.get_field_unchecked(index)) }
     }
     pub fn get_field_unchecked(&self, index: usize) -> &Field {
         let start = unsafe { *self.bucket.offset.as_ptr().add(self.index as usize) };
@@ -607,7 +588,7 @@ impl<'a> LogEntry<'a> {
             .map(move |(index, _)| LogEntry { index: (index + range.start as usize) as u32, bucket: self.bucket })
     }
     pub fn fields(&self) -> Fields<'_> {
-        Fields { fields: self.raw_fields(), bucket: self.bucket }
+        Fields { fields: self.raw_fields(), keys: self.archetype().field_keys(), bucket: self.bucket }
     }
     pub fn raw_span_id(&self) -> u32 {
         let span_index = unsafe { *self.bucket.span_index.as_ptr().add(self.index as usize) };
@@ -675,10 +656,10 @@ impl From<FieldKind> for FieldKindSet {
 }
 impl FieldKindSet {
     pub const NUMBERS: Self = FieldKindSet {
-        raw: (1 << FieldKind::I48 as u8)
+        raw: (1 << FieldKind::I60 as u8)
             | (1 << FieldKind::I64 as u8)
             | (1 << FieldKind::U64 as u8)
-            | (1 << FieldKind::F48 as u8),
+            | (1 << FieldKind::F60 as u8),
     };
     pub const fn empty() -> Self {
         FieldKindSet { raw: 0 }
@@ -745,8 +726,6 @@ impl Bucket {
                 random_state: RandomState::new(),
                 data: mmap_alloc(BUCKET_DATA_SIZE),
                 field: mmap_alloc(BUCKET_FIELD_SIZE),
-                bloom: mmap_alloc(BUCKET_LOG_SIZE + 1),
-                target: mmap_alloc(BUCKET_LOG_SIZE + 1),
                 timerange: mmap_alloc((BUCKET_LOG_SIZE + 1) / TIME_RANGE_LOG_COUNT),
                 // msg_ptr: mmap_alloc(BUCKET_MAX_TARGET_SIZE),
                 // msg: mmap_alloc(BUCKET_LOG_SIZE + 1),
@@ -780,6 +759,7 @@ impl Bucket {
         intern.general.clear();
         intern.uuid.clear();
         intern.keys.clear();
+        intern.target_summaries.clear();
         intern.indexed = 0;
         intern.msgs = 0;
         intern.data_len = 0;
@@ -797,6 +777,49 @@ impl Bucket {
     unsafe fn data_unchecked(&self, data: InternedRange) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.data.as_ptr().add(data.offset as usize), data.len as usize) }
     }
+
+    /// Bucket archetype at the given index. Crate-internal accessor used by
+    /// the stream encoder.
+    pub(crate) unsafe fn archetype_at(&self, index: u16) -> &archetype::Archetype {
+        unsafe { &*self.archetype.as_ptr().add(index as usize) }
+    }
+
+    /// Archetype id assigned to the log entry at `log_index`.
+    pub(crate) unsafe fn archetype_id_at(&self, log_index: u32) -> u16 {
+        unsafe { *self.archetype_index.as_ptr().add(log_index as usize) }
+    }
+
+    /// Span id assigned to the log entry, or `u32::MAX` if no span.
+    pub(crate) unsafe fn span_index_at(&self, log_index: u32) -> u32 {
+        unsafe { *self.span_index.as_ptr().add(log_index as usize) }
+    }
+
+    /// SpanRange at the given span id.
+    pub(crate) unsafe fn span_range_at(&self, span_id: u32) -> &SpanRange {
+        unsafe { &*self.span_data.as_ptr().add(span_id as usize) }
+    }
+
+    /// Field slice for the log entry at `log_index`.
+    pub(crate) unsafe fn fields_at(&self, log_index: u32) -> &[Field] {
+        let start = unsafe { *self.offset.as_ptr().add(log_index as usize) } as usize;
+        let end = unsafe { *self.offset.as_ptr().add(log_index as usize + 1) } as usize;
+        unsafe { std::slice::from_raw_parts(self.field.as_ptr().add(start), end - start) }
+    }
+
+    /// Read interned bytes for a `[InternedRange]`. Used by the stream encoder.
+    pub(crate) unsafe fn data_bytes(&self, range: InternedRange) -> &[u8] {
+        unsafe { self.data_unchecked(range) }
+    }
+
+    /// Read 16 UUID bytes at the given data offset.
+    pub(crate) unsafe fn uuid_at(&self, offset: u32) -> &[u8; 16] {
+        unsafe { self.uuid_bytes(offset) }
+    }
+
+    /// Read an unaligned u64 at the given data offset (used for FieldKind::I64/U64).
+    pub(crate) unsafe fn u64_at(&self, offset: u32) -> u64 {
+        unsafe { self.u64_unchecked(offset) }
+    }
     pub fn read(&self) -> Option<BucketGuard<'_>> {
         if self.len.load(Ordering::Acquire) == 0 {
             return None;
@@ -805,16 +828,18 @@ impl Bucket {
         self.ref_count.fetch_add(1, Ordering::AcqRel);
         let new_len = self.len.load(Ordering::Acquire);
         if new_len == 0 {
-            if self.ref_count.fetch_sub(1, Ordering::AcqRel) == 0 {
+            if self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
                 atomic_wait::wake_one(&self.ref_count);
             }
             return None;
         }
+        let span_count = self.span_count.load(Ordering::Acquire);
+        let archetype_count = self.archetype_count.load(Ordering::Acquire);
         // ensure that generation, loaded so we can used
         // relaxed later, while ref_count == 0 generation will
         // not change
         let _ = self.generation.load(Ordering::Acquire);
-        Some(BucketGuard { bucket: self, len: new_len })
+        Some(BucketGuard { bucket: self, len: new_len, span_count, archetype_count })
     }
 }
 
@@ -921,6 +946,8 @@ impl<'a> GenerationGuard<'a> {
 pub struct BucketGuard<'a> {
     bucket: &'a Bucket,
     len: usize,
+    span_count: usize,
+    archetype_count: usize,
 }
 impl<'a> BucketGuard<'a> {
     pub fn entry_count(&self) -> usize {
@@ -931,9 +958,12 @@ impl<'a> BucketGuard<'a> {
     }
     pub fn is_alive(&self, log: WeakLogEntry) -> bool {
         self.bucket.generation.load(Ordering::Relaxed) == log.bucket_generation
+            && (log.index as usize) < self.len
     }
     pub fn renew(&mut self) {
         self.len = self.bucket.len.load(Ordering::Acquire);
+        self.span_count = self.bucket.span_count.load(Ordering::Acquire);
+        self.archetype_count = self.bucket.archetype_count.load(Ordering::Acquire);
     }
     pub fn reverse_time_range_skip(&self, offset: u32, range: TimeFilter) -> u32 {
         if self.len & (!(TIME_RANGE_LOG_COUNT - 1)) <= offset as usize {
@@ -953,7 +983,9 @@ impl<'a> BucketGuard<'a> {
     }
 
     pub fn upgrade(&self, log: WeakLogEntry) -> Option<LogEntry<'a>> {
-        if self.bucket.generation.load(Ordering::Relaxed) == log.bucket_generation {
+        if self.bucket.generation.load(Ordering::Relaxed) == log.bucket_generation
+            && (log.index as usize) < self.len
+        {
             Some(LogEntry { bucket: self.bucket, index: log.index })
         } else {
             None
@@ -963,53 +995,18 @@ impl<'a> BucketGuard<'a> {
         let span = self.bucket.span_index.as_ptr();
         unsafe { std::slice::from_raw_parts(span, self.len) }
     }
-    pub fn level_query(&self, mask: u8) -> impl Iterator<Item = LogEntry> + '_ {
-        let query = BloomBuilder::default().query(mask);
-        self.blooms()
-            .iter()
-            .enumerate()
-            .filter(move |(_, bloom)| bloom.matches(&query))
-            .map(|(index, _)| LogEntry { index: index as u32, bucket: &self.bucket })
-    }
-
-    // #[inline]
-    ///todo vectorize more
-    pub fn level_query2(&self, mask: u8) -> impl Iterator<Item = LogEntry> + '_ {
-        let lmask = (mask as u64) * 0x01010101_01010101;
-        let data = self.wide_blooms();
-        //todo handle last little bit
-        //todo handle endians
-        data.iter().enumerate().flat_map(move |(i, batch)| {
-            let mut tgx = batch & lmask;
-            let mut b = 0;
-            std::iter::from_fn(move || {
-                while tgx != 0 {
-                    let k = tgx & 0xff;
-                    b += 1;
-                    tgx >>= 8;
-                    if k != 0 {
-                        return Some(LogEntry { index: ((i << 3) | b) as u32, bucket: &self.bucket });
-                    }
-                }
-                None
-            })
-        })
-    }
-
     pub fn entries(&self) -> impl Iterator<Item = LogEntry> + DoubleEndedIterator + ExactSizeIterator + '_ {
         (0..self.len).map(|index| LogEntry { index: index as u32, bucket: &self.bucket })
     }
 
     pub fn archetypes(&self) -> &[archetype::Archetype] {
-        let amount = self.bucket.archetype_count.load(Ordering::Acquire);
         let ptr = self.bucket.archetype.as_ptr();
-        unsafe { std::slice::from_raw_parts(ptr, amount) }
+        unsafe { std::slice::from_raw_parts(ptr, self.archetype_count) }
     }
     /// You must not use the returned slice after the bucket guard has been dropped
     pub unsafe fn archetypes_bucket_lifetime(&self) -> &'a [archetype::Archetype] {
-        let amount = self.bucket.archetype_count.load(Ordering::Acquire);
         let ptr = self.bucket.archetype.as_ptr();
-        unsafe { std::slice::from_raw_parts(ptr, amount) }
+        unsafe { std::slice::from_raw_parts(ptr, self.archetype_count) }
     }
     pub fn archetype_index(&self) -> &[u16] {
         let ptr = self.bucket.archetype_index.as_ptr();
@@ -1017,25 +1014,8 @@ impl<'a> BucketGuard<'a> {
     }
 
     pub fn spans(&self) -> &[SpanRange] {
-        let len = self.bucket.span_count.load(Ordering::Acquire);
         let span = self.bucket.span_data.as_ptr();
-        unsafe { std::slice::from_raw_parts(span, len) }
-    }
-    fn wide_blooms(&self) -> &[u64] {
-        let bloom = self.bucket.bloom.as_ptr();
-        unsafe { std::slice::from_raw_parts(bloom as *const u64, self.len / 8) }
-    }
-    fn blooms(&self) -> &[BloomLine] {
-        let bloom = self.bucket.bloom.as_ptr();
-        unsafe { std::slice::from_raw_parts(bloom, self.len) }
-    }
-    pub fn logs(&self) -> impl Iterator<Item = (u64, BloomLine, &[Field])> + '_ {
-        self.timestamps()
-            .iter()
-            .copied()
-            .zip(self.blooms())
-            .enumerate()
-            .map(|(i, (ts, bloom))| (ts, *bloom, self.fields_of(i as u32)))
+        unsafe { std::slice::from_raw_parts(span, self.span_count) }
     }
     pub fn timestamps(&self) -> &[u64] {
         let timestamp = self.bucket.timestamp.as_ptr();
@@ -1062,41 +1042,43 @@ impl<'a> BucketGuard<'a> {
         if map.indexed >= self.len {
             return map;
         };
-        // println!("WHAT: {}", self.len);
-        let (targets, level) = unsafe {
-            let start = map.indexed;
-            let len = self.len - map.indexed;
-            (
-                std::slice::from_raw_parts(self.bucket.target.as_ptr().add(start as usize), len),
-                std::slice::from_raw_parts(self.bucket.bloom.as_ptr().add(start as usize), len),
-            )
-        };
 
-        for (target, level) in targets.iter().zip(level) {
-            let target = *target as usize;
+        let offset_ptr = self.bucket.offset.as_ptr();
+        let field_ptr = self.bucket.field.as_ptr();
+        let archetype_index_ptr = self.bucket.archetype_index.as_ptr();
+
+        for log_index in map.indexed..self.len {
+            let arch = unsafe {
+                let archetype_index = *archetype_index_ptr.add(log_index);
+                self.bucket.archetype(archetype_index)
+            };
+            let target = arch.target_id as usize;
             if target >= map.target_summaries.len() {
-                map.target_summaries.resize(target as usize + 1, TargetSummary { level_counts: [0; 4] });
+                map.target_summaries.resize(target + 1, TargetSummary { level_counts: [0; 4] });
             }
-            map.target_summaries[target].level_counts[level.level() as usize] += 1;
-        }
+            map.target_summaries[target].level_counts[arch.level() as usize] += 1;
 
-        let unprocessed_fields = unsafe {
-            let start = *self.bucket.offset.as_ptr().add(map.indexed);
-            let end = *self.bucket.offset.as_ptr().add(self.len);
-            std::slice::from_raw_parts(self.bucket.field.as_ptr().add(start as usize), (end - start) as usize)
-        };
+            let (start, end) = unsafe { (*offset_ptr.add(log_index), *offset_ptr.add(log_index + 1)) };
+            if start == end {
+                continue;
+            }
+            let fields = unsafe { std::slice::from_raw_parts(field_ptr.add(start as usize), (end - start) as usize) };
+            let keys = arch.field_keys();
+            debug_assert_eq!(fields.len(), keys.len());
 
-        for field in unprocessed_fields {
-            let key_info = map.keys.get_mut_or_default(unsafe { field.key() });
-            key_info.total += 1;
-            key_info.kinds.insert(field.kind());
-            if key_info.values.len() < 32 {
-                let hash = self.bucket.random_state.hash_one(field);
-                use hashbrown::hash_table::Entry;
-                if let Entry::Vacant(entry) =
-                    key_info.values.entry(hash, |v| v == field, |value| self.bucket.random_state.hash_one(value))
-                {
-                    entry.insert(*field);
+            for (field, key) in fields.iter().zip(keys) {
+                map.index_field_value(self.bucket, *field);
+                let key_info = map.keys.get_mut_or_default(*key);
+                key_info.total += 1;
+                key_info.kinds.insert(field.kind());
+                if key_info.values.len() < 32 {
+                    let hash = self.bucket.random_state.hash_one(field);
+                    use hashbrown::hash_table::Entry;
+                    if let Entry::Vacant(entry) =
+                        key_info.values.entry(hash, |v| v == field, |value| self.bucket.random_state.hash_one(value))
+                    {
+                        entry.insert(*field);
+                    }
                 }
             }
         }
@@ -1107,7 +1089,7 @@ impl<'a> BucketGuard<'a> {
 }
 impl<'a> Drop for BucketGuard<'a> {
     fn drop(&mut self) {
-        if self.bucket.ref_count.fetch_sub(1, Ordering::AcqRel) == 0 {
+        if self.bucket.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             atomic_wait::wake_one(&self.bucket.ref_count);
         }
     }
@@ -1144,6 +1126,22 @@ impl IndexReader {
         let forward = reverse.forward_query();
         (reverse, forward)
     }
+    pub fn bidirectional_query_from<'a>(
+        &'a self,
+        filters: &'a [GeneralFilter],
+        offset: WeakLogEntry,
+    ) -> Option<(ReverseQueryWalker<'a>, ForwardQueryWalker<'a>)> {
+        let guard = self.generation_guard();
+        if unsafe { !guard.is_alive(offset) } {
+            return None;
+        }
+        drop(guard);
+
+        let mut reverse = self.reverse_query(filters);
+        reverse.seek_to(offset);
+        let forward = reverse.forward_query();
+        Some((reverse, forward))
+    }
     pub fn forward_query<'a>(&'a self, filters: &'a [GeneralFilter]) -> ForwardQueryWalker<'a> {
         let mut time_range = TimeFilter { min_utc_ns: 0, max_utc_ns: u64::MAX };
         for filter in filters {
@@ -1172,10 +1170,7 @@ impl IndexReader {
     /// starting from the oldest available entries.
     ///
     /// [`forward_query`]: Self::forward_query
-    pub fn forward_query_from_oldest<'a>(
-        &'a self,
-        filters: &'a [GeneralFilter],
-    ) -> ForwardQueryWalker<'a> {
+    pub fn forward_query_from_oldest<'a>(&'a self, filters: &'a [GeneralFilter]) -> ForwardQueryWalker<'a> {
         let mut time_range = TimeFilter { min_utc_ns: 0, max_utc_ns: u64::MAX };
         for filter in filters {
             if let GeneralFilter::Time(filter) = filter {
@@ -1258,7 +1253,7 @@ impl IndexReader {
 // }
 
 unsafe fn mmap_alloc<T: Sized>(amount: usize) -> NonNull<T> {
-    let x = unsafe {
+    let raw = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             amount * std::mem::size_of::<T>(),
@@ -1267,7 +1262,11 @@ unsafe fn mmap_alloc<T: Sized>(amount: usize) -> NonNull<T> {
             -1,
             0,
         )
-    } as *mut T;
+    };
+    if raw == libc::MAP_FAILED {
+        panic!("mmap failed");
+    }
+    let x = raw as *mut T;
     let szx = amount * std::mem::size_of::<T>();
     if szx > 4 * 1024 * 1024 {
         // unsafe {
@@ -1294,12 +1293,16 @@ pub struct InternedRange {
     pub(crate) offset: u32,
 }
 impl InternedRange {
-    fn from_field_mask(field_mask: u64) -> InternedRange {
+    pub(crate) fn from_field_mask(field_mask: u64) -> InternedRange {
         InternedRange { offset: field_mask as u32, len: (field_mask >> 32) as u16, data: 0 }
     }
-    fn field_mask(&self) -> u64 {
+    pub(crate) fn field_mask(&self) -> u64 {
         self.offset as u64 | ((self.len as u64) << 32)
     }
+}
+
+fn same_range(left: InternedRange, right: InternedRange) -> bool {
+    left.offset == right.offset && left.len == right.len && left.data == right.data
 }
 
 #[derive(Debug)]
@@ -1350,6 +1353,11 @@ pub struct Index {
 
     chunk_max_utc_ns: u64,
     chunk_min_utc_ns: u64,
+
+    log_encoder: Option<BucketLogStreamEncoder>,
+    active_log: Option<Vec<u8>>,
+    pending_finalized: VecDeque<DrainedLogBuffer>,
+    entries_in_current_bucket: u64,
 }
 unsafe impl Send for Index {}
 
@@ -1388,7 +1396,22 @@ impl Index {
         })
         .flat_map(|(bucket, indices)| indices.into_iter().map(|index| LogEntry { bucket, index }))
     }
-    pub(crate) fn complete_bucket(&mut self) {
+    pub fn complete_bucket(&mut self) {
+        let persistence_was_on = self.active_log.is_some();
+        if let Some(mut buf) = self.active_log.take() {
+            let close_ts = system_time_now_ns();
+            stream_encoder::write_footer(&mut buf, close_ts, self.entries_in_current_bucket);
+            self.pending_finalized.push_back(DrainedLogBuffer {
+                bytes: buf,
+                generation: self.generation as u64,
+                closed: true,
+            });
+        }
+        self.entries_in_current_bucket = 0;
+        if let Some(enc) = self.log_encoder.as_mut() {
+            enc.reset();
+        }
+
         //todo handle bucket sizes
         self.fields_used = 0;
         self.data_used = 0;
@@ -1397,14 +1420,18 @@ impl Index {
         self.custom_keys = 0;
         self.general_intern_map.clear();
         self.uuid_intern_map.clear();
+        self.archetype_map.clear();
+        self.msg_map.clear();
         self.span_table.clear();
         self.new_ranges.clear();
         self.new_uuids.clear();
+        self.dirty = false;
         self.generation += 1;
 
         let bucket = &self.reader.buckets[self.generation & 0b11];
         bucket.len.store(0, Ordering::Release);
         bucket.span_count.store(0, Ordering::Release);
+        bucket.archetype_count.store(0, Ordering::Release);
 
         let mut ref_count = bucket.ref_count.fetch_sub(1, Ordering::Acquire);
         while ref_count != 0 {
@@ -1418,6 +1445,7 @@ impl Index {
             bucket_maps.general.clear();
             bucket_maps.uuid.clear();
             bucket_maps.keys.clear();
+            bucket_maps.target_summaries.clear();
             bucket_maps.data_len = 0;
             bucket_maps.msgs = 0;
             bucket_maps.indexed = 0;
@@ -1425,16 +1453,20 @@ impl Index {
         bucket.generation.store(self.generation as u32, Ordering::Release);
         self.reader.generation.store(self.generation as u32, Ordering::Release);
         bucket.ref_count.fetch_add(1, Ordering::Release);
+
+        if persistence_was_on {
+            let mut buf = Vec::with_capacity(BUCKET_LOG_BUFFER_INITIAL_CAPACITY);
+            stream_encoder::write_header(&mut buf, self.generation as u64);
+            self.active_log = Some(buf);
+        }
     }
     pub fn current_bucket_memory_used(&self) -> BucketMemoryStats {
         let interned_bytes = self.data_used;
         let per_log_bytes = self.logs_used
             * (
-                std::mem::size_of::<BloomLine>()
-            + std::mem::size_of::<u32>() //span_id
+                std::mem::size_of::<u32>() //span_id
             + std::mem::size_of::<u64>() //timestamp
             + std::mem::size_of::<u32>() //offset
-            + std::mem::size_of::<u16>() //target
             + std::mem::size_of::<u16>()
                 //archetype
             );
@@ -1458,6 +1490,16 @@ impl Index {
         }
     }
     pub fn new() -> Index {
+        Index::with_config(IndexConfig::default())
+    }
+    pub fn with_config(config: IndexConfig) -> Index {
+        let (log_encoder, active_log) = if config.persistence_enabled {
+            let mut buf = Vec::with_capacity(BUCKET_LOG_BUFFER_INITIAL_CAPACITY);
+            stream_encoder::write_header(&mut buf, 0);
+            (Some(BucketLogStreamEncoder::new()), Some(buf))
+        } else {
+            (None, None)
+        };
         Index {
             fields_used: 0,
             data_used: 0,
@@ -1477,6 +1519,10 @@ impl Index {
             reader: Arc::new(IndexReader::new()),
             chunk_max_utc_ns: u64::MIN,
             chunk_min_utc_ns: u64::MAX,
+            log_encoder,
+            active_log,
+            pending_finalized: VecDeque::new(),
+            entries_in_current_bucket: 0,
         }
     }
     pub unsafe fn clear_unchecked(&mut self) {
@@ -1488,17 +1534,380 @@ impl Index {
         self.general_intern_map.clear();
         self.uuid_intern_map.clear();
         self.archetype_map.clear();
+        self.msg_map.clear();
         self.span_table.clear();
         self.new_ranges.clear();
         self.new_uuids.clear();
         self.generation = 0;
+        self.reader.generation.store(0, Ordering::Release);
         self.chunk_max_utc_ns = u64::MIN;
         self.chunk_min_utc_ns = u64::MAX;
         self.dirty = false;
 
+        self.pending_finalized.clear();
+        self.entries_in_current_bucket = 0;
+        if let Some(enc) = self.log_encoder.as_mut() {
+            enc.reset();
+        }
+        if let Some(mut buf) = self.active_log.take() {
+            buf.clear();
+            stream_encoder::write_header(&mut buf, 0);
+            self.active_log = Some(buf);
+        }
+
         for (i, bucket) in self.reader.buckets.iter().enumerate() {
             unsafe { bucket.clear_unchecked(i as u32) }
         }
+    }
+
+    /// Atomically swap the active log byte buffer for `fresh`. Returns the
+    /// previously active buffer wrapped in a [`DrainedLogBuffer`], or `None`
+    /// when persistence is disabled. The fresh buffer is cleared on entry so
+    /// callers may reuse one from a pool.
+    ///
+    /// The encoder dedup state stays on the index across swaps. Mid-bucket
+    /// swap returns a buffer with no footer; concatenating drained buffers
+    /// in order reconstructs the complete stream file.
+    pub fn swap_log_buffer(&mut self, mut fresh: Vec<u8>) -> Option<DrainedLogBuffer> {
+        self.active_log.as_ref()?;
+        fresh.clear();
+        let previous = self.active_log.replace(fresh).expect("active_log presence checked above");
+        Some(DrainedLogBuffer { bytes: previous, generation: self.generation as u64, closed: false })
+    }
+
+    /// Pop a finalized buffer from the pending queue. A finalized buffer ends
+    /// with the file footer for its bucket. Drain in a loop until `None` after
+    /// each rotation to avoid stalling the queue.
+    pub fn take_finalized_log_buffer(&mut self) -> Option<DrainedLogBuffer> {
+        self.pending_finalized.pop_front()
+    }
+
+    /// Generation of the bucket the active log buffer belongs to, if any.
+    pub fn active_log_generation(&self) -> Option<u64> {
+        self.active_log.as_ref().map(|_| self.generation as u64)
+    }
+
+    /// Byte length of the current active log buffer. Useful for sizing-based
+    /// drain triggers from a writer thread.
+    pub fn active_log_buffer_len(&self) -> Option<usize> {
+        self.active_log.as_ref().map(|b| b.len())
+    }
+
+    /// Replay a stream slice into this index. Bypasses [`Index::write`]:
+    /// decl frames pre-populate the existing dedup maps and Record frames
+    /// write straight into bucket arrays. Returns the number of records
+    /// applied.
+    pub fn ingest(&mut self, bytes: &[u8]) -> Result<u64, crate::persistence::format::ReadError> {
+        crate::persistence::replay::ingest(self, bytes)
+    }
+
+    /// Install a general string/bytes decl from a stream. Writes the bytes
+    /// into bucket.data at `offset` (extending data_used), inserts the
+    /// InternedRange into the local map and stages it for later commit into
+    /// `bucket.intern_map.general`.
+    pub(crate) fn install_string_decl(
+        &mut self,
+        offset: u32,
+        len: u16,
+        bytes: &[u8],
+    ) -> Result<(), crate::persistence::format::ReadError> {
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        let end = offset as usize + len as usize;
+        if end > BUCKET_DATA_SIZE {
+            return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
+        }
+        unsafe {
+            bucket.data.as_ptr().add(offset as usize).copy_from_nonoverlapping(bytes.as_ptr(), len as usize);
+        }
+        if end > self.data_used {
+            self.data_used = end;
+        }
+        let range = InternedRange { offset, data: 0, len };
+        let hash = bucket.random_state.hash_one(bytes);
+        // Insert into the local in-progress map; commit will push into bucket.intern_map.general.
+        self.general_intern_map
+            .insert_unique(hash, range, |t| bucket.random_state.hash_one(unsafe { bucket.data_unchecked(*t) }));
+        self.new_ranges.push((range, hash));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Install a UUID decl: writes 16 bytes at the given offset and stages
+    /// the index for the bucket UUID intern map.
+    pub(crate) fn install_uuid_decl(
+        &mut self,
+        offset: u32,
+        bytes: &[u8; 16],
+    ) -> Result<(), crate::persistence::format::ReadError> {
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        let end = offset as usize + 16;
+        if end > BUCKET_DATA_SIZE {
+            return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
+        }
+        unsafe {
+            bucket.data.as_ptr().add(offset as usize).copy_from_nonoverlapping(bytes.as_ptr(), 16);
+        }
+        if end > self.data_used {
+            self.data_used = end;
+        }
+        let hash = bucket.random_state.hash_one(bytes);
+        self.uuid_intern_map
+            .insert_unique(hash, offset, |t| bucket.random_state.hash_one(unsafe { bucket.uuid_bytes(*t) }));
+        self.new_uuids.push((offset, hash));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Install a Msg decl: writes the bytes at the given offset and inserts
+    /// directly into the msg_map.
+    pub(crate) fn install_msg_decl(
+        &mut self,
+        msg_id: u16,
+        offset: u32,
+        len: u16,
+        bytes: &[u8],
+    ) -> Result<(), crate::persistence::format::ReadError> {
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        let end = offset as usize + len as usize;
+        if end > BUCKET_DATA_SIZE {
+            return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
+        }
+        unsafe {
+            bucket.data.as_ptr().add(offset as usize).copy_from_nonoverlapping(bytes.as_ptr(), len as usize);
+        }
+        if end > self.data_used {
+            self.data_used = end;
+        }
+        let range = InternedRange { offset, data: msg_id, len };
+        let hash = bucket.random_state.hash_one(bytes);
+        self.msg_map.insert_unique(hash, range, |t| bucket.random_state.hash_one(unsafe { bucket.data_unchecked(*t) }));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Intern a target name into the local target cache and return its u16.
+    /// Returns `None` if the shared target buffer is exhausted; callers must
+    /// drop the offending record so a hostile or runaway producer cannot
+    /// crash the ingest thread.
+    pub(crate) fn install_target(&mut self, name: &[u8]) -> Option<u16> {
+        self.target_map.intern(&self.reader.targets, name)
+    }
+
+    /// Install a SpanDecl: write the SpanRange to bucket.span_data and insert
+    /// into span_table.
+    pub(crate) fn install_span_decl(
+        &mut self,
+        span_id: u32,
+        span: SpanID,
+        parent: Option<SpanID>,
+    ) -> Result<(), crate::persistence::format::ReadError> {
+        if (span_id as usize) >= BUCKET_SPAN_RANGE_SIZE {
+            return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
+        }
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        // Initialize first_mask/last_mask to 0; the Record frame will update them
+        // based on the span_kind reported per record.
+        unsafe {
+            bucket.span_data.as_ptr().add(span_id as usize).write(SpanRange {
+                id: span,
+                parent,
+                first_mask: 0,
+                last_mask: AtomicU32::new(0),
+            });
+        }
+        if (span_id as usize) >= self.spans_used {
+            self.spans_used = (span_id as usize) + 1;
+        }
+        self.span_table.insert(span, span_id);
+        Ok(())
+    }
+
+    /// Install an ArchetypeDecl: build an Archetype struct and place it in
+    /// bucket.archetype, then insert the new id into archetype_map.
+    pub(crate) fn install_archetype_decl(
+        &mut self,
+        msg_id: u16,
+        target_id: u16,
+        level: LogLevel,
+        in_span: bool,
+        service: Option<ServiceId>,
+        field_keys: &[u16],
+    ) -> Result<(), crate::persistence::format::ReadError> {
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        // Look up msg's offset/len from msg_map keyed by msg_id (== InternedRange.data).
+        // Iterate (msg_map is small; this is bounded by archetype-decl frequency, not records).
+        let mut msg_offset = 0u32;
+        let mut msg_len = 0u16;
+        if let Some(found) = self.msg_map.iter().find(|r| r.data == msg_id) {
+            msg_offset = found.offset;
+            msg_len = found.len;
+        }
+        let archetype_id = self.archetype_map.len();
+        if archetype_id >= BUCKET_ARCHETYPE_SIZE {
+            return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
+        }
+        let mut mask = 1u32 << level as u8;
+        if in_span {
+            mask |= 1 << 4;
+        }
+        let mut field_headers = [u16::MAX; archetype::FIELD_LANES];
+        for (i, &k) in field_keys.iter().enumerate().take(archetype::FIELD_LANES) {
+            field_headers[i] = k;
+        }
+        let dex = Archetype {
+            msg_offset,
+            msg_len,
+            target_id,
+            mask,
+            service,
+            pad: 0,
+            size: field_keys.len() as u16,
+            field_headers,
+        };
+        unsafe {
+            bucket.archetype.as_ptr().add(archetype_id).write(dex);
+        }
+        let archetype_id_u16 = archetype_id as u16;
+        let hash = bucket.random_state.hash_one(unsafe { bucket.archetype(archetype_id_u16) });
+        self.archetype_map
+            .insert_unique(hash, archetype_id_u16, |t| bucket.random_state.hash_one(unsafe { bucket.archetype(*t) }));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Read in_span flag from a previously-installed archetype.
+    pub(crate) fn archetype_in_span_for(&self, archetype_id: u16) -> Option<bool> {
+        if (archetype_id as usize) >= self.archetype_map.len() {
+            return None;
+        }
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        Some(unsafe { bucket.archetype(archetype_id) }.in_span())
+    }
+
+    /// Read field count from a previously-installed archetype.
+    pub(crate) fn archetype_field_count_for(&self, archetype_id: u16) -> Option<u16> {
+        if (archetype_id as usize) >= self.archetype_map.len() {
+            return None;
+        }
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        Some(unsafe { bucket.archetype(archetype_id) }.size)
+    }
+
+    /// Install a Record frame: write timestamp, archetype id, span_index,
+    /// fields, offset entry. Bumps logs_used. Level and target are encoded in
+    /// the archetype.
+    pub(crate) fn install_record(
+        &mut self,
+        archetype_id: u16,
+        timestamp: u64,
+        span_kind: Option<crate::persistence::format::SpanKindTag>,
+        span_id: Option<u32>,
+        fields: &[Field],
+    ) -> Result<(), crate::persistence::format::ReadError> {
+        if self.logs_used >= BUCKET_LOG_SIZE {
+            return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
+        }
+        if self.fields_used + fields.len() > BUCKET_FIELD_SIZE {
+            return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
+        }
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        let log_index = self.logs_used;
+
+        unsafe {
+            bucket.timestamp.as_ptr().add(log_index).write(timestamp);
+            bucket.archetype_index.as_ptr().add(log_index).write(archetype_id);
+        }
+
+        // Span handling: update SpanRange.first_mask / last_mask based on span_kind.
+        match (span_kind, span_id) {
+            (Some(kind), Some(sid)) => {
+                let sr = unsafe { &*bucket.span_data.as_ptr().add(sid as usize) };
+                let raw_index = log_index as u32;
+                use crate::persistence::format::SpanKindTag;
+                match kind {
+                    SpanKindTag::StartWithParent | SpanKindTag::Start => unsafe {
+                        (bucket.span_data.as_ptr().add(sid as usize) as *mut SpanRange).write(SpanRange {
+                            id: sr.id,
+                            parent: sr.parent,
+                            first_mask: raw_index | (1u32 << 31),
+                            last_mask: AtomicU32::new(raw_index),
+                        });
+                    },
+                    SpanKindTag::Current => {
+                        sr.last_mask.store(raw_index, Ordering::Release);
+                    }
+                    SpanKindTag::End => {
+                        sr.last_mask.store(raw_index | (1u32 << 31), Ordering::Release);
+                    }
+                }
+                unsafe {
+                    bucket.span_index.as_ptr().add(log_index).write(sid);
+                }
+            }
+            _ => unsafe {
+                bucket.span_index.as_ptr().add(log_index).write(u32::MAX);
+            },
+        }
+
+        // Fields.
+        let start = self.fields_used;
+        for (i, field) in fields.iter().enumerate() {
+            unsafe {
+                bucket.field.as_ptr().add(start + i).write(*field);
+            }
+        }
+        self.fields_used += fields.len();
+
+        // Offset table: bucket.offset[log_index] is already set; bucket.offset[log_index+1] = fields_used.
+        unsafe {
+            bucket.offset.as_ptr().add(log_index + 1).write(self.fields_used as u32);
+        }
+
+        // Time range periodic write (mirroring write_current_to_bucket).
+        self.chunk_min_utc_ns = timestamp.min(self.chunk_min_utc_ns);
+        self.chunk_max_utc_ns = timestamp.max(self.chunk_max_utc_ns);
+        if self.logs_used & (TIME_RANGE_LOG_COUNT - 1) == (TIME_RANGE_LOG_COUNT - 1) {
+            unsafe {
+                bucket
+                    .timerange
+                    .as_ptr()
+                    .add(self.logs_used >> TIME_RANGE_LOG_COUNT.trailing_zeros())
+                    .write(TimeRange { min_utc_ns: self.chunk_min_utc_ns, max_utc_nc: self.chunk_max_utc_ns });
+            }
+            self.chunk_max_utc_ns = u64::MIN;
+            self.chunk_min_utc_ns = u64::MAX;
+        }
+
+        self.logs_used += 1;
+        self.entries_in_current_bucket += 1;
+        Ok(())
+    }
+
+    /// Drain any pending replay state into the bucket's intern maps.
+    /// Mirrors `commit()` but is called once at the end of a replay run
+    /// rather than per-record.
+    pub(crate) fn flush_pending(&mut self) {
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        if self.dirty || !self.new_ranges.is_empty() || !self.new_uuids.is_empty() {
+            let mut map = bucket.intern_map.lock().unwrap();
+            for (range, hash) in &self.new_ranges {
+                map.general.insert_unique(*hash, *range, |t| {
+                    bucket.random_state.hash_one(unsafe { bucket.data_unchecked(*t) })
+                });
+            }
+            for (range, hash) in &self.new_uuids {
+                map.uuid
+                    .insert_unique(*hash, *range, |t| bucket.random_state.hash_one(unsafe { bucket.uuid_bytes(*t) }));
+            }
+            map.msgs = self.msg_map.len();
+            map.data_len = self.data_used;
+            self.new_ranges.clear();
+            self.new_uuids.clear();
+            self.dirty = false;
+            bucket.archetype_count.store(self.archetype_map.len(), Ordering::Release);
+        }
+        bucket.span_count.store(self.spans_used, Ordering::Release);
+        bucket.len.store(self.logs_used, Ordering::Release);
     }
     pub fn write<'a, T: Iterator<Item = Result<(Key<'a>, Value<'a>), MunchError>> + Clone>(
         &mut self,
@@ -1512,17 +1921,49 @@ impl Index {
         // as long as we don't commit should just have to reset the counters,
         // Or defer updating the counters until we know the no error is possible.
         if self.write_current_to_bucket(timestamp, level, span_info.clone(), service_id, fields.clone())? {
+            self.emit_record(timestamp, &span_info);
             self.commit();
             return Ok(WeakLogEntry { bucket_generation: self.generation as u32, index: self.logs_used as u32 - 1 });
         }
         // Ran out of storage in this bucket lets move to the next one
         self.complete_bucket();
-        if !self.write_current_to_bucket(timestamp, level, span_info, service_id, fields)? {
-            // Todo make this a proper error
-            panic!("Log too large to fit in a single bucket");
+        if !self.write_current_to_bucket(timestamp, level, span_info.clone(), service_id, fields)? {
+            // A single record that won't fit in an empty bucket is malformed
+            // input; previously this panicked and killed ingest. Surface it
+            // as an error so the producer's bad record is dropped and the
+            // service keeps ingesting subsequent records.
+            return Err(MunchError::InvalidValue);
         }
+        self.emit_record(timestamp, &span_info);
         self.commit();
         Ok(WeakLogEntry { bucket_generation: self.generation as u32, index: self.logs_used as u32 - 1 })
+    }
+
+    /// Emit the wire frames for the log entry just written into the bucket.
+    /// No-op when persistence is disabled. Called between
+    /// `write_current_to_bucket` and `commit` so the encoder can read the
+    /// just-staged entries from `new_ranges` / `new_uuids` before they are
+    /// drained.
+    fn emit_record(&mut self, timestamp: u64, span_info: &SpanInfo) {
+        let Some(enc) = &mut self.log_encoder else {
+            return;
+        };
+        let Some(buf) = &mut self.active_log else {
+            return;
+        };
+        let log_index = (self.logs_used - 1) as u32;
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        let msg_count = self.msg_map.len();
+        let span_count = self.span_table.len();
+        let new_ranges: &[_] = &self.new_ranges;
+        let new_uuids: &[_] = &self.new_uuids;
+        let msg_map = &self.msg_map;
+        let targets = &self.reader.targets;
+        stream_encoder::record(
+            enc, buf, bucket, new_ranges, new_uuids, msg_map, msg_count, span_count, targets, log_index, timestamp,
+            span_info,
+        );
+        self.entries_in_current_bucket += 1;
     }
     fn write_current_to_bucket<'a>(
         &mut self,
@@ -1539,10 +1980,10 @@ impl Index {
         unsafe {
             bucket.timestamp.as_ptr().add(self.logs_used).write(timestamp);
         }
-        let mut bloom = crate::bloom::BloomBuilder::default();
         let mut msg: &[u8] = b"";
         let mut target: &[u8] = b"";
         let fields_start = self.fields_used;
+        let mut field_keys: SmallVec<[u16; archetype::FIELD_LANES]> = SmallVec::new();
         for pair in fields {
             let (key, value) = pair?;
             let key_bits = match key {
@@ -1563,31 +2004,39 @@ impl Index {
                     key as u16
                 }
                 kvlog::encoding::Key::Dynamic(key) => {
-                    //todo handle utf8?
-                    KeyID::intern(std::str::from_utf8(key).unwrap()).raw()
+                    // A non-UTF-8 dynamic key was previously a panic. Surface
+                    // it as a record-level error so a malformed record cannot
+                    // kill the ingest thread.
+                    let Ok(name) = std::str::from_utf8(key) else {
+                        return Err(MunchError::InvalidKey);
+                    };
+                    KeyID::intern(name).raw()
                 }
             };
+            if field_keys.len() >= archetype::FIELD_LANES {
+                continue;
+            }
             // println!("{:?}", value);
             let (kind, value_bits) = match value {
                 Value::String(text) => {
-                    let Some(interned) = self.intern(text) else {
+                    let Some(interned) = self.intern(text)? else {
                         return Ok(false);
                     };
                     (FieldKind::String, interned.field_mask())
                 }
                 Value::Bytes(bytes) => {
-                    let Some(interned) = self.intern(bytes) else {
+                    let Some(interned) = self.intern(bytes)? else {
                         return Ok(false);
                     };
                     (FieldKind::Bytes, interned.field_mask())
                 }
-                Value::I32(num) => (FieldKind::I48, i48::from_i64(num as i64)),
-                Value::U32(num) => (FieldKind::I48, i48::from_i64(num as i64)),
+                Value::I32(num) => (FieldKind::I60, i60::from_i64(num as i64)),
+                Value::U32(num) => (FieldKind::I60, i60::from_i64(num as i64)),
                 Value::I64(num) => {
-                    if let Some(value) = i48::try_from_i64(num) {
-                        (FieldKind::I48, value)
+                    if let Some(value) = i60::try_from_i64(num) {
+                        (FieldKind::I60, value)
                     } else {
-                        let Some(interned) = self.intern(&num.to_ne_bytes()) else {
+                        let Some(interned) = self.intern(&num.to_ne_bytes())? else {
                             return Ok(false);
                         };
                         (FieldKind::I64, interned.field_mask())
@@ -1595,23 +2044,23 @@ impl Index {
                 }
                 Value::U64(num) => {
                     if let Ok(signed) = i64::try_from(num) {
-                        if let Some(value) = i48::try_from_i64(signed) {
-                            (FieldKind::I48, value)
+                        if let Some(value) = i60::try_from_i64(signed) {
+                            (FieldKind::I60, value)
                         } else {
-                            let Some(interned) = self.intern(&signed.to_ne_bytes()) else {
+                            let Some(interned) = self.intern(&signed.to_ne_bytes())? else {
                                 return Ok(false);
                             };
                             (FieldKind::I64, interned.field_mask())
                         }
                     } else {
-                        let Some(interned) = self.intern(&num.to_ne_bytes()) else {
+                        let Some(interned) = self.intern(&num.to_ne_bytes())? else {
                             return Ok(false);
                         };
                         (FieldKind::U64, interned.field_mask())
                     }
                 }
-                Value::F32(float) => (FieldKind::F48, f64_to_f48(float as f64)),
-                Value::F64(float) => (FieldKind::F48, f64_to_f48(float)),
+                Value::F32(float) => (FieldKind::F60, f64_to_f60(float as f64)),
+                Value::F64(float) => (FieldKind::F60, f64_to_f60(float)),
                 Value::UUID(id) => {
                     let Some(interned) = self.intern_uuid(&id) else {
                         return Ok(false);
@@ -1620,20 +2069,17 @@ impl Index {
                 }
                 Value::Bool(value) => (FieldKind::Bool, value as u64),
                 Value::None => (FieldKind::None, 0),
-                Value::Seconds(float) => (FieldKind::Seconds, f64_to_f48(float as f64)),
+                Value::Seconds(float) => (FieldKind::Seconds, f64_to_f60(float as f64)),
                 Value::Timestamp(ts) => {
-                    // TODO have external time storage for things that don't fit.
-                    // At first this seems quite bad, but atleast with the main user of kvlog
-                    // they use millisecond position timestamps, and 48 bits will captures over a thousand years after epoch
-                    let x = ts.as_millisecond_clamped().clamp(0, (1 << 48) - 1) as u64;
+                    let x = ts.as_millisecond_clamped().clamp(0, (1i64 << 60) - 1) as u64;
                     (FieldKind::Timestamp, x)
                 }
             };
-            let field = Field::new(key_bits, kind, value_bits);
-            bloom.insert(field);
-            if self.fields_used > BUCKET_FIELD_SIZE {
+            let field = Field::new(kind, value_bits);
+            if self.fields_used >= BUCKET_FIELD_SIZE {
                 return Ok(false);
             }
+            field_keys.push(key_bits);
             unsafe {
                 let bucket = &self.reader.buckets[self.generation & 0b11];
                 bucket.field.as_ptr().add(self.fields_used).write(field);
@@ -1641,17 +2087,22 @@ impl Index {
             self.fields_used += 1;
         }
         //todo don't require message and target
-        let Some(msg_intern) = self.intern_msg(msg) else {
+        let Some(msg_intern) = self.intern_msg(msg)? else {
             return Ok(false);
         };
         let bucket = &self.reader.buckets[self.generation & 0b11];
-        let target_intern = self.target_map.intern(&self.reader.targets, target);
+        // Drop the record (rather than panic) if the global target buffer is
+        // full. `MunchError::InvalidValue` lets callers surface the failure
+        // and continue ingesting subsequent records.
+        let Some(target_intern) = self.target_map.intern(&self.reader.targets, target) else {
+            return Err(MunchError::InvalidValue);
+        };
         let fields = unsafe {
             std::slice::from_raw_parts_mut(bucket.field.as_ptr().add(fields_start), self.fields_used - fields_start)
         };
-        fields.sort_unstable_by_key(|f| f.raw);
+        sort_fields_by_key(fields, &mut field_keys);
         let dex =
-            archetype::Archetype::new(msg_intern, target_intern, level, !span_info.is_none(), service_id, &fields);
+            archetype::Archetype::new(msg_intern, target_intern, level, !span_info.is_none(), service_id, &field_keys);
         let dex_id = {
             let hash = bucket.random_state.hash_one(&dex);
             let len = self.archetype_map.len();
@@ -1676,21 +2127,6 @@ impl Index {
         unsafe {
             bucket.archetype_index.as_ptr().add(self.logs_used).write(dex_id);
         }
-
-        /// todod
-        unsafe {
-            bucket.bloom.as_ptr().add(self.logs_used).write(bloom.line(level));
-        }
-        unsafe {
-            bucket.target.as_ptr().add(self.logs_used).write(target_intern);
-        }
-        // unsafe {
-        //     bucket
-        //         .msg
-        //         .as_ptr()
-        //         .add(self.logs_used)
-        //         .write(msg_intern.data);
-        // }
 
         let mut end_mask = 0;
         let mut start_mask = 0;
@@ -1786,6 +2222,9 @@ impl Index {
         }
         bucket.span_count.store(self.spans_used, Ordering::Release);
         bucket.len.store(self.logs_used, Ordering::Release);
+        if let Some(enc) = self.log_encoder.as_mut() {
+            enc.after_commit();
+        }
     }
     fn intern_uuid(&mut self, id: &uuid::Uuid) -> Option<u32> {
         let bucket = &self.reader.buckets[self.generation & 0b11];
@@ -1814,7 +2253,10 @@ impl Index {
         }
     }
 
-    fn intern_msg(&mut self, bytes: &[u8]) -> Option<InternedRange> {
+    fn intern_msg(&mut self, bytes: &[u8]) -> Result<Option<InternedRange>, MunchError> {
+        if bytes.len() > u16::MAX as usize {
+            return Err(MunchError::InvalidValue);
+        }
         let bucket = &self.reader.buckets[self.generation & 0b11];
         let hash = bucket.random_state.hash_one(bytes);
         let len = self.msg_map.len();
@@ -1824,13 +2266,13 @@ impl Index {
             |t| bucket.random_state.hash_one(unsafe { bucket.data_unchecked(*t) }),
         );
         match entry {
-            hashbrown::hash_table::Entry::Occupied(entry) => Some(*entry.get()),
+            hashbrown::hash_table::Entry::Occupied(entry) => Ok(Some(*entry.get())),
             hashbrown::hash_table::Entry::Vacant(entry) => {
                 if bytes.len() + self.data_used > BUCKET_DATA_SIZE {
-                    return None;
+                    return Ok(None);
                 }
                 if len >= BUCKET_MAX_MSG_SIZE {
-                    return None;
+                    return Ok(None);
                 }
                 let range = InternedRange { offset: self.data_used as u32, data: len as u16, len: bytes.len() as u16 };
                 // unsafe {
@@ -1842,14 +2284,17 @@ impl Index {
                 }
                 entry.insert(range);
                 self.data_used += bytes.len();
-                Some(range)
+                Ok(Some(range))
             }
         }
     }
 
-    fn intern(&mut self, bytes: &[u8]) -> Option<InternedRange> {
+    fn intern(&mut self, bytes: &[u8]) -> Result<Option<InternedRange>, MunchError> {
         if bytes.is_empty() {
-            return Some(InternedRange { len: 0, data: 0, offset: 0 });
+            return Ok(Some(InternedRange { len: 0, data: 0, offset: 0 }));
+        }
+        if bytes.len() > u16::MAX as usize {
+            return Err(MunchError::InvalidValue);
         }
         let bucket = &self.reader.buckets[self.generation & 0b11];
         let hash = bucket.random_state.hash_one(bytes);
@@ -1859,10 +2304,10 @@ impl Index {
             |t| bucket.random_state.hash_one(unsafe { bucket.data_unchecked(*t) }),
         );
         match entry {
-            hashbrown::hash_table::Entry::Occupied(entry) => Some(*entry.get()),
+            hashbrown::hash_table::Entry::Occupied(entry) => Ok(Some(*entry.get())),
             hashbrown::hash_table::Entry::Vacant(entry) => {
                 if bytes.len() + self.data_used > BUCKET_DATA_SIZE {
-                    return None;
+                    return Ok(None);
                 }
                 let range = InternedRange { offset: self.data_used as u32, data: 0, len: bytes.len() as u16 };
                 self.new_ranges.push((range, hash));
@@ -1871,15 +2316,15 @@ impl Index {
                 }
                 entry.insert(range);
                 self.data_used += bytes.len();
-                Some(range)
+                Ok(Some(range))
             }
         }
     }
 }
-pub(crate) mod i48 {
-    pub const MIN: i64 = -(1i64 << 47);
-    pub const MAX: i64 = (1i64 << 47) - 1;
-    const MASK: u64 = (1u64 << 48) - 1;
+pub(crate) mod i60 {
+    pub const MIN: i64 = -(1i64 << 59);
+    pub const MAX: i64 = (1i64 << 59) - 1;
+    const MASK: u64 = (1u64 << 60) - 1;
     pub fn try_from_i64(value: i64) -> Option<u64> {
         if value >= MIN && value <= MAX {
             Some(from_i64(value))
@@ -1897,7 +2342,7 @@ pub(crate) mod i48 {
     mod test {
         use super::*;
         #[test]
-        fn i48_mapping() {
+        fn i60_mapping() {
             for i in [MIN, MAX, -1, 43, 683, 0] {
                 assert_eq!(i, to_i64(try_from_i64(i).unwrap()))
             }

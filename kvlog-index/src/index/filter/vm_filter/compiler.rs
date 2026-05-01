@@ -126,24 +126,24 @@ fn compile_pred<'b>(
 ) -> Result<(), VmCompileError> {
     match pred {
         Pred::Field(key_id, field_test) => {
-            compile_field_tests(comp, bb, false, fail, succ, *key_id, std::slice::from_ref(field_test));
+            compile_field_tests(comp, bb, false, fail, succ, *key_id, std::slice::from_ref(field_test))?;
         }
         Pred::FieldOr(key_id, field_tests) => {
-            compile_field_tests(comp, bb, false, fail, succ, *key_id, field_tests);
+            compile_field_tests(comp, bb, false, fail, succ, *key_id, field_tests)?;
         }
         Pred::FieldAnd(key_id, field_tests) => {
-            compile_field_tests(comp, bb, true, fail, succ, *key_id, field_tests);
+            compile_field_tests(comp, bb, true, fail, succ, *key_id, field_tests)?;
         }
         Pred::And(preds) => {
             let inner_block = comp.asm.block(Some(bb), succ);
             for pred in *preds {
-                compile_pred(comp, inner_block, fail, Ret::Next(inner_block), pred);
+                compile_pred(comp, inner_block, fail, Ret::Next(inner_block), pred)?;
             }
         }
         Pred::Or(preds) => {
             let inner_block = comp.asm.block(Some(bb), fail);
             for pred in *preds {
-                compile_pred(comp, inner_block, Ret::Next(inner_block), succ, pred);
+                compile_pred(comp, inner_block, Ret::Next(inner_block), succ, pred)?;
             }
         }
         Pred::HasParentSpan(_) => return Err(VmCompileError::UnsupportedPredicate(PredKind::HasParentSpan)),
@@ -257,11 +257,6 @@ mod test {
     use kvlog::encoding::{FieldBuffer, Seconds};
     use kvlog::Encode;
 
-    fn key_mask(key: &str) -> u64 {
-        let key = KeyID::intern(key);
-        let field = Field::new(key.raw(), crate::index::FieldKind::Bool, 0);
-        field.raw & !INV_KEY_MASK
-    }
     #[test]
     fn simple_compliation() {
         let mut index = test_index();

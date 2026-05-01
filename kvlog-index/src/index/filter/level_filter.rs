@@ -19,19 +19,15 @@ impl LevelFilter {
         LevelFilter { mask: 0b1111 }
     }
     pub fn with(self, level: LogLevel) -> LevelFilter {
-        LevelFilter {
-            mask: self.mask | (1 << (level as u8)),
-        }
+        LevelFilter { mask: self.mask | (1 << (level as u8)) }
     }
     pub fn without(self, level: LogLevel) -> LevelFilter {
-        LevelFilter {
-            mask: self.mask & !(1 << (level as u8)),
-        }
+        LevelFilter { mask: self.mask & !(1 << (level as u8)) }
     }
     pub fn contains(&self, level: LogLevel) -> bool {
         (self.mask & (1 << (level as u8))) != 0
     }
     pub fn matches(&self, entry: LogEntry) -> bool {
-        (entry.raw_bloom() & self.mask) != 0
+        entry.archetype().level_in(*self)
     }
 }

@@ -35,11 +35,7 @@ impl LiveQuery {
     pub fn update_query(&mut self, query: Vec<GeneralFilter>) {
         let mut shared = self.shared.current_query.lock().unwrap();
         self.counter += 1;
-        *shared = Query {
-            query_id: self.counter,
-            filters: query,
-            newest_first: false,
-        };
+        *shared = Query { query_id: self.counter, filters: query, newest_first: false };
         self.shared.query_id.store(self.counter, Ordering::Release)
     }
     pub async fn next(&self) -> QueryChunk<'_> {

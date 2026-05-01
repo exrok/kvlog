@@ -12,7 +12,7 @@ use assembler::Assembler;
 use crate::{
     index::{
         self,
-        i48::{self, try_from_i64},
+        i60::{self, try_from_i64},
         Bucket, BucketGuard, Field, FieldKind,
     },
     query::{
@@ -54,6 +54,7 @@ pub enum VmCompileError {
     UnsupportedPredicate(PredKind),
     UnsupportedFieldTest(FieldTestKind),
     UnsupportedMessageTest,
+    TooManyFieldKeys,
     EmptyCode,
 }
 
@@ -231,9 +232,6 @@ impl VmFilter {
         unsafe { std::mem::transmute::<&mut QueryVm<'static>, &'a mut QueryVm<'a>>(&mut self.filter) }
     }
 }
-
-const INV_KEY_MASK: u64 = (0xFFFF_FFFF_FFFF_FFFF >> 12);
-const INV_KEY_TYPE_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFF >> 16;
 
 // fn eval(code: &[Inst], entry: LogEntry) -> bool {
 //     let mut inst = &code[0];
@@ -541,8 +539,7 @@ unsafe fn print_instructions(code: &[DataRepr], keys: &[u16]) {
 }
 
 fn print_field(field: Field) {
-    let key = KeyID::try_raw_to_str(field.raw_key()).unwrap_or("UNKNOWN");
-    println!("{:>8}: {:10} 0x{:012}", key, field.kind().to_str(), field.value_mask());
+    println!("{:10} 0x{:012}", field.kind().to_str(), field.value_mask());
 }
 
 unsafe fn eval_inst_2(ip: *const Inst, log: LogEntry, table: KeyTable) -> bool {
@@ -702,7 +699,7 @@ fn service_set_contains(index: u8, bitset: &[u64; 4]) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::index::i48::to_i64;
+    use crate::index::i60::to_i64;
     use crate::index::test::{test_index, TestIndexWriter};
     use crate::index::Bucket;
     use crate::log;
@@ -736,40 +733,12 @@ mod test {
             Ret::True,
             Ret::False,
             key,
-            &[
-                Field::new(key.raw(), FieldKind::I48, i48::from_i64(2)),
-                Field::new(key.raw(), FieldKind::I48, i48::from_i64(0)),
-            ],
+            &[Field::new(FieldKind::I60, i60::from_i64(2)), Field::new(FieldKind::I60, i60::from_i64(0))],
         );
         let mut vm = asm.build().unwrap();
 
         assert!(vm.matches(entry!(k1 = 0, k2 = 1)));
         assert!(!vm.matches(entry!(k1 = 2, k2 = 0)));
         assert!(!vm.matches(entry!(k1 = 1, k2 = 2)));
-
-        // assert_eq!(eval(&k1_or_k2, entry!(k1 = "hello", k2 = "nice")), true);
-        // assert_eq!(eval(&k1_or_k2, entry!(k2 = true, k3 = "hello")), true);
-
-        // !k1 && !k2
-        //     #[rustfmt::skip]
-        //     let not_k1_nor_k2 = [
-        //         /*0*/ Inst::new(Op::LoadKeyMin, key_mask("k1"), 1, FALSE),
-        //         /*1*/ Inst::new(Op::RegOrLoadKeyMin, key_mask("k2"), TRUE, FALSE),
-        //     ];
-
-        //     assert_eq!(eval(&not_k1_nor_k2, entry!(k1 = "hello", k2 = "nice")), false);
-        //     assert_eq!(eval(&not_k1_nor_k2, entry!(k2 = true, k3 = "hello")), false);
-        //     assert_eq!(eval(&not_k1_nor_k2, entry!(k3 = "hello")), true);
-
-        //     // k2.starts_with("hi")
-        //     #[rustfmt::skip]
-        //     let k2_starts_with_hi = [
-        //         /*1*/ Inst::new(Op::LoadKeyMin, key_mask("k2"), FALSE, 1),
-        //         /*1*/ Inst::new_text(Op::RegTextStartsWith, b"hi", FALSE, TRUE),
-        //     ];
-
-        //     assert_eq!(eval(&k2_starts_with_hi, entry!(k1 = "hi", k2 = "bye")), false);
-        //     assert_eq!(eval(&k2_starts_with_hi, entry!(k1 = "bye", k2 = "hi")), true);
-        //     assert_eq!(eval(&k2_starts_with_hi, entry!(k3 = "hello")), false);
     }
 }

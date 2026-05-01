@@ -1,4 +1,4 @@
-use crate::index::f48::f64_to_f48;
+use crate::index::f60::{f60_to_f64, f64_to_f60};
 
 use super::*;
 use bumpalo::collections::Vec as BumpVec;
@@ -63,7 +63,7 @@ fn try_field_test_merge<'b>(tests: &mut [FieldTest<'b>], merge_candidate: FieldT
             for (i, test) in tests.iter_mut().enumerate() {
                 if let FieldTest::DurationRange { negated: b_neg, min_seconds: b_min, max_seconds: b_max } = *test {
                     let b = range_eval::RangePredicate::<u64> { negated: b_neg, min: b_min, max: b_max };
-                    return match range_eval::range_merge(a, b, 0, (1 << 48) - 1, true) {
+                    return match range_eval::range_merge(a, b, 0, (1u64 << 60) - 1, true) {
                         range_eval::RangeMerge::None => continue,
                         range_eval::RangeMerge::Merged(range_predicate) => {
                             *test = FieldTest::DurationRange {
@@ -197,10 +197,10 @@ fn field_test_supports_text_field(test: &FieldTest) -> bool {
     }
 }
 
-fn f48_seconds_to_u64_nanos_clamped(sec: u64) -> u64 {
-    let seconds = f48_to_f64(sec);
+fn f60_seconds_to_u64_nanos_clamped(sec: u64) -> u64 {
+    let seconds = f60_to_f64(sec);
     let nanos = seconds.abs() * 1_000_000_000.0;
-    if nanos > u64::MAX as f64 || sec >= (1u64 << 48) - 1 {
+    if nanos > u64::MAX as f64 || sec >= (1u64 << 60) - 1 {
         return u64::MAX;
     }
     if nanos < 0.0 || sec == 0 {
@@ -225,8 +225,8 @@ fn meta_field_test_to_pred<'b>(
         MetaField::SpanDuration => match *test {
             FieldTest::DurationRange { negated, min_seconds, max_seconds } => PredBuilder::SpanDurationRange {
                 negated,
-                min_ns: f48_seconds_to_u64_nanos_clamped(min_seconds),
-                max_ns: f48_seconds_to_u64_nanos_clamped(max_seconds),
+                min_ns: f60_seconds_to_u64_nanos_clamped(min_seconds),
+                max_ns: f60_seconds_to_u64_nanos_clamped(max_seconds),
             },
             _ => throw!(UnsupportedOperationOnSpan @ parser.span_info.text_span(key.as_str())),
         },
@@ -546,7 +546,7 @@ fn expr_eq_field_test<'b>(expr: Expr<'b>) -> Option<FieldTest<'b>> {
         Bytes(value) => FieldTest::BytesEqual(false, value),
         Float(value) => FieldTest::FloatRange { negated: false, min: value, max: value },
         Duration(value) => {
-            FieldTest::DurationRange { negated: false, min_seconds: f64_to_f48(value), max_seconds: f64_to_f48(value) }
+            FieldTest::DurationRange { negated: false, min_seconds: f64_to_f60(value), max_seconds: f64_to_f60(value) }
         }
         Signed(value) => FieldTest::I64Eq(false, value),
         Unsigned(value) => FieldTest::U64Eq(false, value),
@@ -724,7 +724,7 @@ impl<'a, 'b> Parser<'a, 'b> {
                 Duration(value) => FieldTest::DurationRange {
                     negated: false,
                     min_seconds: 0,
-                    max_seconds: f64_to_f48(value).saturating_sub(1),
+                    max_seconds: f64_to_f60(value).saturating_sub(1),
                 },
                 Signed(value) => {
                     FieldTest::FloatRange { negated: false, min: f64::MIN, max: (value as f64).next_down() }
@@ -737,7 +737,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             LtEq => match expr[1] {
                 Float(value) => FieldTest::FloatRange { negated: false, min: f64::MIN, max: value },
                 Duration(value) => {
-                    FieldTest::DurationRange { negated: false, min_seconds: 0, max_seconds: f64_to_f48(value) }
+                    FieldTest::DurationRange { negated: false, min_seconds: 0, max_seconds: f64_to_f60(value) }
                 }
                 Signed(value) => FieldTest::FloatRange { negated: false, min: f64::MIN, max: (value as f64) },
                 Unsigned(value) => FieldTest::FloatRange { negated: false, min: f64::MIN, max: (value as f64) },
@@ -747,7 +747,7 @@ impl<'a, 'b> Parser<'a, 'b> {
                 Float(value) => FieldTest::FloatRange { negated: false, min: value.next_up(), max: f64::MAX },
                 Duration(value) => FieldTest::DurationRange {
                     negated: false,
-                    min_seconds: (f64_to_f48(value) + 1).min((1 << 48) - 1),
+                    min_seconds: (f64_to_f60(value) + 1).min((1u64 << 60) - 1),
                     max_seconds: u64::MAX,
                 },
                 Signed(value) => FieldTest::FloatRange { negated: false, min: (value as f64).next_up(), max: f64::MAX },
@@ -759,7 +759,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             GtEq => match expr[1] {
                 Float(value) => FieldTest::FloatRange { negated: false, min: value, max: f64::MAX },
                 Duration(value) => {
-                    FieldTest::DurationRange { negated: false, min_seconds: f64_to_f48(value), max_seconds: u64::MAX }
+                    FieldTest::DurationRange { negated: false, min_seconds: f64_to_f60(value), max_seconds: u64::MAX }
                 }
                 Signed(value) => FieldTest::FloatRange { negated: false, min: value as f64, max: f64::MAX },
                 Unsigned(value) => FieldTest::FloatRange { negated: false, min: value as f64, max: f64::MAX },

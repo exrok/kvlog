@@ -52,10 +52,7 @@ impl TargetLevelFilter {
         *collect & entry.mask as u8 != 0
     }
     pub fn matches(&self, entry: LogEntry) -> bool {
-        let Some(collect) = self.mask.get(entry.target_id() as usize) else {
-            return false;
-        };
-        *collect & entry.raw_bloom() != 0
+        self.matches_archtype(entry.archetype())
     }
 }
 
@@ -247,7 +244,7 @@ pub enum QueryStrategy {
     Archetype { archetypes: Box<U16Set> },
     ArchetypeWithFilters { archetypes: Box<U16Set>, filters: Vec<GeneralFilter> },
     ArchetypeWithVm { archetypes: Box<U16Set>, vm: VmFilter },
-    ArchetypeContainsField { archetypes: Box<U16Set>, field: Field },
+    ArchetypeContainsField { archetypes: Box<U16Set>, key: KeyID, field: Field },
     Empty,
 }
 impl QueryStrategy {
@@ -316,7 +313,7 @@ impl<'a> ForwardSegmentWalker<'a> {
             log_count: 0,
         }
     }
-    fn release(&mut self) {
+    pub(crate) fn release(&mut self) {
         self.bucket = None;
     }
     //guarded bucket
@@ -340,6 +337,7 @@ impl<'a> ForwardSegmentWalker<'a> {
                     let ret = QueryContinuation::Reload { bucket, previous_summary_count: self.summary_count };
                     self.log_count = bucket_guard.len as u32;
                     self.summary_count = bucket.archetype_count.load(Ordering::Relaxed) as u32;
+                    self.bucket = Some(bucket_guard);
                     return ret;
                 }
             }
@@ -367,7 +365,6 @@ impl<'a> ForwardSegmentWalker<'a> {
                 // // Not sure exactly what needs to happen here need to read the code
             };
             if new_bucket.bucket.generation.load(Ordering::Relaxed) != self.generation {
-                self.generation += 1;
                 continue;
             }
             self.summary_count = new_bucket.bucket.archetype_count.load(Ordering::Relaxed) as u32;
@@ -385,6 +382,13 @@ enum ForwardQueryState {
 }
 
 impl<'a> ForwardQueryWalker<'a> {
+    /// Drop the held [`BucketGuard`] without losing the walker's position.
+    /// The next call to [`Self::next`] re-acquires a guard for the current
+    /// generation. Call this before any `.await` so a slow consumer cannot
+    /// keep the bucket pinned and stall ingest's `complete_bucket()` rotation.
+    pub fn release_bucket_reclamation_lock(&mut self) {
+        self.segments.release();
+    }
     // important don't make `'_` be `'a` because then could escape bucket guard
     pub fn next(&mut self) -> Option<EntryCollection<'_>> {
         let bucket = match self.segments.next(self.index) {
@@ -652,7 +656,7 @@ fn specialize_with_archetype_index(
 
                 if let Pred::Field(key, FieldTest::EqRaw(false, field)) = pred {
                     // Don't know if this is still faster compared to the VM as currently implemented
-                    return QueryStrategy::ArchetypeContainsField { archetypes: possible_archetypes, field };
+                    return QueryStrategy::ArchetypeContainsField { archetypes: possible_archetypes, key, field };
                 }
 
                 match QueryVm::compile(bump, pred, bucket, reader.targets.mapper()) {
@@ -715,6 +719,14 @@ fn specialize_with_archetype_index(
 impl<'a> ReverseQueryWalker<'a> {
     pub fn grouped_by_spans(self) -> ReverseQuerySpanGrouper<'a> {
         ReverseQuerySpanGrouper { used_spans: hashbrown::HashSet::default(), walker: self }
+    }
+    pub fn seek_to(&mut self, offset: WeakLogEntry) {
+        self.current_bucket = None;
+        self.next_generation = offset.bucket_generation();
+        self.current_offset = offset.index().saturating_add(1);
+        self.strategy = QueryStrategy::Simple;
+        self.buffer.clear();
+        self.frozen = true;
     }
     fn specialize(&mut self, bucket: &BucketGuard<'a>) {
         self.strategy = specialize_with_archetype_index(bucket, &self.general_filter, self.index);
@@ -804,7 +816,7 @@ impl<'a> ReverseQueryWalker<'a> {
                 ) as u32;
                 Some(EntryCollection { bucket_generation: bucket.bucket, entries })
             }
-            QueryStrategy::ArchetypeContainsField { archetypes: set, field: exact } => {
+            QueryStrategy::ArchetypeContainsField { archetypes: set, key, field: exact } => {
                 let mut entries: Vec<u32> = Vec::new();
                 let mut end = self.current_offset as usize;
                 let until = self.current_offset.saturating_sub(4096 * 4) as usize;
@@ -819,8 +831,7 @@ impl<'a> ReverseQueryWalker<'a> {
                     );
                     for i in &self.buffer {
                         let entry = LogEntry { bucket: bucket.bucket, index: *i };
-                        //todo try contains
-                        if entry.raw_fields().contains(exact) {
+                        if entry.field_by_key_id(*key) == Some(*exact) {
                             entries.push(*i);
                         }
                     }
@@ -932,6 +943,7 @@ impl KeyMapCache {
         return bucket;
     }
     pub fn new(keys: &[KeyID]) -> Box<KeyMapCache> {
+        assert!(keys.len() <= 8, "VM key cache supports at most eight field keys");
         unsafe {
             let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<KeyMapCache>());
             if ptr.is_null() {
@@ -944,7 +956,7 @@ impl KeyMapCache {
             for entry in &mut cache.index_cache {
                 entry.0 = u16::MAX;
             }
-            cache.len = keys.len().max(8) as u32;
+            cache.len = keys.len() as u32;
             cache
         }
     }
@@ -953,35 +965,11 @@ impl KeyMapCache {
 }
 
 #[cold]
-#[cfg(all(target_arch = "x86_64", target_feature = "sse2", target_feature = "bmi2"))]
 unsafe fn load_inputs(query: &[u16], raw_archetype: u16, bucket: &Bucket, output_indices: &mut [u8; 8]) {
     std::hint::assert_unchecked(query.len() <= 8);
     let arch = bucket.archetype(raw_archetype);
-    use core::arch::x86_64::*;
-
-    let data_ptr = arch.field_headers.as_ptr() as *const __m128i;
-    let simd_data: __m128i = _mm_loadu_si128(data_ptr);
     for (i, key) in query.iter().enumerate() {
-        let simd_value: __m128i = _mm_set1_epi16(*key as i16);
-        let cmp_result: __m128i = _mm_cmpeq_epi16(simd_data, simd_value);
-        let mask: i32 = _mm_movemask_epi8(cmp_result);
-
-        if mask != 0 {
-            let lsb_bit_index: u32 = _tzcnt_u32(mask as u32);
-            // The u16 element index is half the bit index.
-            let index = (lsb_bit_index / 2);
-            output_indices[i] = index as u8;
-        }
-    }
-}
-
-#[cold]
-#[cfg(not(all(target_arch = "x86_64", target_feature = "sse2", target_feature = "bmi2")))]
-unsafe fn load_inputs(query: &[u16], raw_archetype: u16, bucket: &Bucket, output_indices: &mut [u8; 8]) {
-    std::hint::assert_unchecked(query.len() <= 8);
-    let fields = bucket.archetype(raw_archetype);
-    for (i, key) in query.iter().enumerate() {
-        if let Some(j) = fields.index_of(KeyID(*key)) {
+        if let Some(j) = arch.index_of(KeyID(*key)) {
             output_indices[i] = j as u8;
         }
     }

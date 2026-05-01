@@ -319,6 +319,7 @@ pub fn collect_indices_of_values_in_set_reverse(
     output: &mut Vec<u32>,
     target_size: usize,
 ) -> usize {
+    assert!(input_range.start <= input_range.end && input_range.end <= input.len(), "input_range must be within input");
     // Not if this where to overflow reverse with invalid layout panic;
     output.reserve(target_size.saturating_add(8));
     let len = output.len();
@@ -392,7 +393,7 @@ pub fn collect_indices_of_values_in_set_reverse(
             let offset = unsafe { (i as *const u16).offset_from(input.as_ptr()) as u32 };
             output.push(offset);
             if output.len() >= target_size {
-                return (offset as usize) + 1;
+                return offset as usize;
             }
         }
     }
@@ -493,5 +494,23 @@ mod test {
         output.clear();
         collect_indices_of_values_in_set_reverse(&set, &[0, 1, 2], 0..3, &mut output, 1000);
         assert_eq!(&output, &[1, 0]);
+    }
+
+    #[test]
+    fn reverse_collect_resume_excludes_scalar_tail_boundary() {
+        let mut set: Box<U16Set> = Default::default();
+        set.insert(1);
+        set.insert(9);
+        let input = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut output = Vec::new();
+
+        let next = collect_indices_of_values_in_set_reverse(&set, &input, 0..input.len(), &mut output, 2);
+
+        assert_eq!(&output, &[9, 1]);
+        assert_eq!(next, 1);
+
+        output.clear();
+        collect_indices_of_values_in_set_reverse(&set, &input, 0..next, &mut output, 2);
+        assert!(output.is_empty());
     }
 }

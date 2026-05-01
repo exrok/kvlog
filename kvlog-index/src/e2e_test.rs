@@ -4,12 +4,12 @@ use crate::index::test::{test_index, TestIndexWriter};
 use crate::index::{Bucket, GeneralFilter, Index, WeakLogEntry};
 use crate::query::query_parts::parser::Parser;
 use crate::query::query_parts::{self, OptimizationInfo};
-use crate::query::QueryParseError;
+use crate::query::{QueryExpr, QueryParseError};
 use crate::{log, ServiceId};
 use bumpalo::Bump;
 use hashbrown::{HashMap, HashSet};
-use kvlog::encoding::{FieldBuffer, Seconds};
-use kvlog::{Encode, LogLevel};
+use kvlog::encoding::{FieldBuffer, Seconds, SpanInfo};
+use kvlog::{Encode, LogLevel, SpanID};
 struct QueryTester<'a> {
     pub(crate) time: u64,
     pub(crate) buf: FieldBuffer,
@@ -371,6 +371,25 @@ fn never_seen_field() {
 }
 
 #[test]
+fn simple_span_exists_matches_span_presence() {
+    let mut index = test_index();
+    let span = SpanID::next();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let no_span = log!(writer; msg = "outside");
+    let with_span = log!(writer; {span: SpanInfo::Current { span }} msg = "inside");
+
+    let query = QueryExpr::new("$span.exists()").unwrap();
+    let mut found = Vec::new();
+    index.reader().query(&query, |entry| {
+        found.push(entry.weak());
+        true
+    });
+
+    assert_eq!(found, vec![with_span]);
+    assert_ne!(found, vec![no_span]);
+}
+
+#[test]
 fn duration_ranges() {
     let mut index = test_index();
     let mut test_query = QueryTester::new(&mut index);
@@ -576,5 +595,17 @@ fn combo() {
         ({level: LogLevel::Error} arb = 31): error_ish,
         ({level: LogLevel::Warn} msg = "fail", arb = 31, err="badness"): error_ish,
         ({level: LogLevel::Info} msg = "not so bad", arb = 31, err="badness"): error_ish,
+    }
+}
+
+#[test]
+fn vm_unsupported_field_tests_fall_back_to_simple() {
+    let mut index = test_index();
+    let mut tester = QueryTester::new(&mut index);
+    assert_query_results! {
+        tester [ enabled = true && msg.contains("hit") ]
+        (enabled = true, msg = "hit"): true,
+        (enabled = false, msg = "hit"): false,
+        (enabled = true, msg = "miss"): false,
     }
 }

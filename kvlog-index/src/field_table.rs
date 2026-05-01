@@ -52,9 +52,12 @@ impl<T: Default> KeyMap<T> {
 }
 
 static mut BUFFER: NonNull<u8> = NonNull::dangling();
-const BUFFER_SIZE: usize = 1024 * 64;
 static mut LUT: NonNull<u32> = NonNull::dangling();
-const MAX_KEY: usize = 4096;
+const MAX_KEYS: usize = 32768;
+const MAX_KEY_ID: usize = MAX_KEYS - 1;
+const MAX_DYN_KEYS: usize = MAX_KEYS - StaticKey::NAMES.len();
+const MAX_KEY_LEN: usize = 127;
+const BUFFER_SIZE: usize = MAX_DYN_KEYS * MAX_KEY_LEN;
 
 struct Global {
     table: HashTable<KeyID>,
@@ -84,6 +87,17 @@ impl<'a> PartialEq<StaticKey> for KeyID {
 }
 
 impl KeyID {
+    pub fn known_dynamic() -> Vec<(KeyID, &'static str)> {
+        let dyn_key_count = TABLE.lock().unwrap().table.len();
+        (0..dyn_key_count)
+            .map(|index| {
+                let raw = MIN_DYN_KEY + index as u16;
+                let key = unsafe { KeyID::new(raw) };
+                (key, key.as_str())
+            })
+            .collect()
+    }
+
     pub fn try_raw_to_str(raw: u16) -> Option<&'static str> {
         if raw < MIN_DYN_KEY {
             return StaticKey::from_u8(raw as u8).map(|key| key.as_str());
@@ -140,7 +154,7 @@ impl KeyID {
         if table.is_empty() {
             unsafe {
                 BUFFER = NonNull::new(alloc(Layout::new::<[u8; BUFFER_SIZE]>())).unwrap();
-                LUT = NonNull::new(alloc(Layout::new::<[u32; MAX_KEY]>()) as *mut u32).unwrap();
+                LUT = NonNull::new(alloc(Layout::new::<[u32; MAX_DYN_KEYS]>()) as *mut u32).unwrap();
             }
         }
 
@@ -150,6 +164,10 @@ impl KeyID {
         match table.entry(hash, |key| name == key.as_str(), |value| hasher.hash_one(value.as_str())) {
             hashbrown::hash_table::Entry::Occupied(entry) => *entry.get(),
             hashbrown::hash_table::Entry::Vacant(entry) => {
+                let raw_id = len + MIN_DYN_KEY as usize;
+                if len >= MAX_DYN_KEYS || raw_id > MAX_KEY_ID {
+                    panic!("GLOBAL KEY TABLE SIZE EXCEEDED")
+                }
                 let start = *buffer_used;
                 if *buffer_used + name.len() >= BUFFER_SIZE {
                     panic!("GLOBAL KEY BUFFER SIZED EXCEEDED")
@@ -158,7 +176,7 @@ impl KeyID {
                 unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), BUFFER.as_ptr().add(start), name.len()) }
                 unsafe { *LUT.as_ptr().add(len as usize) = start as u32 | ((name.len() as u32) << 24) }
 
-                let id = KeyID((len as u16) + MIN_DYN_KEY);
+                let id = KeyID(raw_id as u16);
                 entry.insert(id);
                 id
             }

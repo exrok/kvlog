@@ -9,13 +9,22 @@ use std::path::Path;
 use crate::index::archetype::ServiceId;
 use crate::index::Index;
 
-const CHUNK_MAGIC: u64 = 0x8910_FC0Eu64 << 32;
-const CHUNK_ALT_MAGIC: u64 = 0xF745_119Eu64 << 32;
-const CHUNK_MAGIC_MASK: u64 = 0xFFFF_FFFFu64 << 32;
-const ENTRY_MAGIC_BYTE: u8 = 0b1110_0001;
-
 const DEFAULT_BUFFER_SIZE: usize = 32 * 1024; // 32KB initial
 const MAX_ENTRY_SIZE: usize = 4 * 1024 * 1024; // 4MB max per entry
+
+/// kvlog socket protocol: standard chunk magic. The lower 32 bits of the 8
+/// byte chunk header carry the chunk payload length.
+const CHUNK_MAGIC: u64 = 0x8910_FC0E_0000_0000;
+
+/// kvlog socket protocol: alt-chunk magic for service announce frames. The
+/// lower 32 bits carry the trailing service name length.
+const CHUNK_ALT_MAGIC: u64 = 0xF745_119E_0000_0000;
+
+/// Mask covering the magic portion of a chunk header.
+const CHUNK_MAGIC_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+
+/// Magic byte at the start of every kvlog entry header.
+const ENTRY_MAGIC_BYTE: u8 = 0xE1;
 
 #[derive(Debug, Clone, Copy)]
 enum DechunkState {
@@ -38,6 +47,7 @@ enum DechunkResult {
     InvalidChunkMagic,
     InvalidEntryMagic,
     EntryTooLarge { size: u32 },
+    EntryExceedsChunk { entry_len: u32, remaining: u32 },
     NeedMoreData,
     Done,
 }
@@ -172,6 +182,9 @@ impl StreamingDechunker {
                     if entry_len > MAX_ENTRY_SIZE as u32 {
                         return DechunkResult::EntryTooLarge { size: entry_len };
                     }
+                    if entry_len > remaining {
+                        return DechunkResult::EntryExceedsChunk { entry_len, remaining };
+                    }
 
                     if self.buffered_len() >= entry_len as usize {
                         let entry_ref = EntryRef { start: self.head, len: entry_len as usize };
@@ -199,7 +212,11 @@ impl StreamingDechunker {
     }
 }
 
-pub fn block_on(unix_socket_path: &Path, index: &mut Index, on_update: &mut dyn FnMut()) -> io::Result<()> {
+pub fn block_on(
+    unix_socket_path: &Path,
+    index: &mut Index,
+    on_update: &mut dyn FnMut(&mut Index),
+) -> io::Result<()> {
     let _ = std::fs::remove_file(unix_socket_path);
     let listener = UnixListener::bind(unix_socket_path)?;
     let server = Server { index, update_signal: on_update };
@@ -208,7 +225,7 @@ pub fn block_on(unix_socket_path: &Path, index: &mut Index, on_update: &mut dyn 
 
 pub struct Server<'a> {
     pub index: &'a mut Index,
-    pub update_signal: &'a mut dyn FnMut(),
+    pub update_signal: &'a mut dyn FnMut(&mut Index),
 }
 
 struct Connection {
@@ -238,8 +255,9 @@ impl<'a> Server<'a> {
         let mut data = entry_data;
         match kvlog::encoding::munch_log_with_span(&mut data) {
             Ok((timestamp, level, span_info, fields)) => {
-                if let Err(err) = self.index.write(timestamp, level, span_info, conn.service_id, fields) {
-                    kvlog::error!("Failed to write log to index", ?err)
+                match self.index.write(timestamp, level, span_info, conn.service_id, fields) {
+                    Ok(_) => {}
+                    Err(err) => kvlog::error!("Failed to write log to index", ?err),
                 }
             }
             Err(MunchError::EofOnHeader | MunchError::EofOnFields | MunchError::Eof) => {
@@ -333,7 +351,8 @@ pub fn run_server(mut listener: UnixListener, server: Server) -> io::Result<()> 
                 }
             }
         }
-        (controller.server.update_signal)();
+        let server = &mut controller.server;
+        (server.update_signal)(server.index);
     }
 }
 
@@ -380,6 +399,15 @@ impl<'a> MioController<'a> {
                             "Entry exceeds maximum size, closing connection",
                             service_name = connection.service_id.map(|a| a.as_str()),
                             size
+                        );
+                        return Ok(true);
+                    }
+                    DechunkResult::EntryExceedsChunk { entry_len, remaining } => {
+                        kvlog::error!(
+                            "Entry exceeds enclosing chunk, closing connection",
+                            service_name = connection.service_id.map(|a| a.as_str()),
+                            entry_len,
+                            remaining
                         );
                         return Ok(true);
                     }
@@ -602,6 +630,22 @@ mod streaming_tests {
         dechunker.read_from(&mut cursor).unwrap();
 
         assert!(matches!(dechunker.next_item(), DechunkResult::EntryTooLarge { .. }));
+    }
+
+    #[test]
+    fn test_entry_larger_than_remaining_chunk_is_rejected() {
+        let entry_header = ((ENTRY_MAGIC_BYTE as u32) << 24) | 9;
+        let chunk_header = CHUNK_MAGIC | 4;
+
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&chunk_header.to_le_bytes());
+        chunk.extend_from_slice(&entry_header.to_le_bytes());
+
+        let mut dechunker = StreamingDechunker::new();
+        let mut cursor = Cursor::new(&chunk);
+        dechunker.read_from(&mut cursor).unwrap();
+
+        assert!(matches!(dechunker.next_item(), DechunkResult::EntryExceedsChunk { entry_len: 13, remaining: 4 }));
     }
 
     #[test]

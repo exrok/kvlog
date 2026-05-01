@@ -1,6 +1,8 @@
 use std::{
     mem::ManuallyDrop,
-    sync::{atomic::AtomicUsize, Condvar},
+    sync::{atomic::AtomicUsize, mpsc, Condvar},
+    thread,
+    time::{Duration, Instant},
 };
 
 use kvlog::{encoding::FieldBuffer, Encode};
@@ -26,6 +28,13 @@ impl IndexPool {
     fn push(&self, index: Box<Index>) {
         {
             self.ready.lock().unwrap().pool.push(index);
+        }
+        self.cond.notify_one();
+    }
+    fn retire(&self) {
+        {
+            let mut ready = self.ready.lock().unwrap();
+            ready.created -= 1;
         }
         self.cond.notify_one();
     }
@@ -57,7 +66,14 @@ pub struct PoolGuard {
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        GLOBAL_TEST_POOL.push(unsafe { ManuallyDrop::take(&mut self.index) })
+        let index = unsafe { ManuallyDrop::take(&mut self.index) };
+        let reusable = std::sync::Arc::strong_count(index.reader()) == 1
+            && index.reader.buckets.iter().all(|bucket| bucket.ref_count.load(Ordering::Acquire) == 1);
+        if reusable {
+            GLOBAL_TEST_POOL.push(index)
+        } else {
+            GLOBAL_TEST_POOL.retire();
+        }
     }
 }
 impl std::ops::Deref for PoolGuard {
@@ -129,6 +145,41 @@ fn test_in_range() {
     assert_eq!(in_range(&[1, 2, 3], 1, 2), &[1, 2]);
     assert_eq!(in_range(&[1, 2, 3], 2, 3), &[2, 3]);
     assert_eq!(in_range(&[10, 20, 30, 40], 11, 29), &[20]);
+}
+
+#[test]
+fn clear_unchecked_resets_reader_generation() {
+    let mut index = test_index();
+    index.write(1, LogLevel::Info, SpanInfo::None, None, LogFields::empty()).unwrap();
+    index.complete_bucket();
+    index.write(2, LogLevel::Info, SpanInfo::None, None, LogFields::empty()).unwrap();
+
+    unsafe {
+        index.clear_unchecked();
+    }
+
+    let weak = index.write(3, LogLevel::Info, SpanInfo::None, None, LogFields::empty()).unwrap();
+    let reader = index.reader().clone();
+    assert_eq!(reader.lastest_generation(), 0);
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(weak).unwrap();
+    assert_eq!(entry.timestamp(), 3);
+}
+
+#[test]
+fn weak_entry_upgrade_rejects_index_past_bucket_len() {
+    let mut index = test_index();
+    let weak = index.write(1, LogLevel::Info, SpanInfo::None, None, LogFields::empty()).unwrap();
+    let stale = WeakLogEntry::new(weak.bucket_generation(), weak.index() + 1);
+    let reader = index.reader().clone();
+
+    let guard = reader.generation_guard();
+    assert!(!unsafe { guard.is_alive(stale) });
+    assert!(unsafe { guard.upgrade(stale) }.is_none());
+
+    let bucket = reader.newest_bucket().unwrap();
+    assert!(!bucket.is_alive(stale));
+    assert!(bucket.upgrade(stale).is_none());
 }
 
 #[test]
@@ -292,4 +343,192 @@ fn int_query() {
     let query = Query::expr(stringify!(count: int = 1)).unwrap();
 
     assert_eq_logs(index.reverse_query(&query.filters), &[w1]);
+}
+
+#[test]
+fn bucket_rollover_wakes_when_last_reader_drops() {
+    let mut index = test_index();
+    index.write(1, LogLevel::Info, SpanInfo::None, None, LogFields::empty()).unwrap();
+    index.complete_bucket();
+    index.write(2, LogLevel::Info, SpanInfo::None, None, LogFields::empty()).unwrap();
+
+    let reader = index.reader().clone();
+    let guard = reader.newest_bucket().unwrap();
+    assert_eq!(guard.bucket.generation.load(Ordering::Acquire), 1);
+
+    let target_bucket = &reader.buckets[1];
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let index = &mut index;
+        let worker = scope.spawn(move || {
+            for _ in 0..4 {
+                index.complete_bucket();
+            }
+            done_tx.send(()).unwrap();
+        });
+
+        let start = Instant::now();
+        while target_bucket.ref_count.load(Ordering::Acquire) != 1 {
+            assert!(start.elapsed() < Duration::from_secs(2), "rollover did not wait on the active reader");
+            thread::yield_now();
+        }
+
+        drop(guard);
+        if done_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            atomic_wait::wake_one(&target_bucket.ref_count);
+            worker.join().unwrap();
+            panic!("rollover was not woken by dropping the last reader");
+        }
+
+        worker.join().unwrap();
+    });
+}
+
+#[test]
+fn rollover_reinterns_message_in_new_bucket() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+
+    let _ = log!(writer; msg="repeat");
+    for _ in 0..4 {
+        writer.index.complete_bucket();
+    }
+    let second = log!(writer; msg="repeat", rollover_clobber = "xxxxxx");
+
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(second).unwrap();
+    assert_eq!(entry.message(), b"repeat");
+}
+
+#[test]
+fn oversized_interned_ranges_are_rejected() {
+    let mut index = test_index();
+    let too_large = vec![b'a'; u16::MAX as usize + 1];
+
+    assert!(matches!(index.intern(&too_large), Err(MunchError::InvalidValue)));
+    assert!(matches!(index.intern_msg(&too_large), Err(MunchError::InvalidValue)));
+}
+
+fn write_log_with_n_fields(writer: &mut TestIndexWriter<'_>, n: usize) -> WeakLogEntry {
+    let time = writer.time;
+    writer.time += 1;
+    let fields = {
+        let mut encoder = writer.buf.encoder();
+        ("hello").encode_log_value_into(encoder.key("msg"));
+        for i in 0..n {
+            let name = format!("f{i:02}");
+            (i as u32).encode_log_value_into(encoder.key(&name));
+        }
+        encoder.fields()
+    };
+    writer.index.write(time, LogLevel::Info, SpanInfo::None, None, fields).unwrap()
+}
+
+#[test]
+fn wide_field_query_finds_each_position() {
+    use crate::field_table::KeyID;
+
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+
+    for n in [9usize, 16, super::archetype::FIELD_LANES] {
+        let weak = write_log_with_n_fields(&mut writer, n);
+        let reader = writer.index.reader().clone();
+        let bucket = reader.newest_bucket().unwrap();
+        let entry = bucket.upgrade(weak).unwrap();
+
+        for i in 0..n {
+            let name = format!("f{i:02}");
+            let key = KeyID::try_from_str(&name).unwrap_or_else(|| panic!("missing key {name} for n={n}"));
+            let field = entry
+                .field_by_key_id(key)
+                .unwrap_or_else(|| panic!("field_by_key_id missed `{name}` at position-of-N {n}"));
+            assert_eq!(field.kind(), FieldKind::I60);
+            assert!(entry.archetype().contains_key(key));
+            assert!(entry.archetype().index_of(key).is_some());
+        }
+
+        let actual = entry.fields().count();
+        assert_eq!(actual, n, "fields() iterator length mismatch for n={n}");
+        assert_eq!(entry.raw_fields().len(), n);
+        assert_eq!(entry.archetype().size as usize, n);
+    }
+}
+
+#[test]
+fn field_overflow_truncates_to_field_lanes() {
+    use crate::field_table::KeyID;
+
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+
+    let lanes = super::archetype::FIELD_LANES;
+    let dropped = 6usize;
+    let n = lanes + dropped;
+    let weak = write_log_with_n_fields(&mut writer, n);
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(weak).unwrap();
+
+    assert_eq!(entry.archetype().size as usize, lanes, "archetype size must clamp to FIELD_LANES");
+    assert_eq!(entry.raw_fields().len(), lanes, "raw_fields must stay consistent with archetype size");
+    assert_eq!(entry.fields().count(), lanes, "fields() iterator must stop at FIELD_LANES");
+
+    let mut found = 0usize;
+    let mut missing = 0usize;
+    for i in 0..n {
+        let name = format!("f{i:02}");
+        let key = KeyID::try_from_str(&name).unwrap_or_else(|| panic!("key {name} should have been interned"));
+        if entry.field_by_key_id(key).is_some() {
+            found += 1;
+        } else {
+            missing += 1;
+        }
+    }
+    assert_eq!(found, lanes, "exactly FIELD_LANES of the {n} keys should be findable");
+    assert_eq!(missing, dropped, "exactly {dropped} keys should have been truncated");
+}
+
+#[test]
+fn archetype_hash_is_deterministic_for_same_keys() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+
+    let w1 = log!(writer; msg="m", a=1u32, b=2u32, c=3u32);
+    let w2 = log!(writer; msg="m", a=1u32, b=2u32, c=3u32);
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let e1 = bucket.upgrade(w1).unwrap();
+    let e2 = bucket.upgrade(w2).unwrap();
+
+    assert_eq!(e1.raw_archetype(), e2.raw_archetype(), "identical key+meta logs should share an archetype");
+    assert_eq!(e1.archetype().as_raw(), e2.archetype().as_raw());
+}
+
+#[test]
+fn oversized_message_does_not_rotate_bucket() {
+    let mut index = test_index();
+    let too_large = vec![b'a'; u16::MAX as usize + 1];
+    #[derive(Clone)]
+    struct OversizedMsg<'a> {
+        bytes: &'a [u8],
+        done: bool,
+    }
+    impl<'a> Iterator for OversizedMsg<'a> {
+        type Item = Result<(Key<'a>, Value<'a>), MunchError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.done {
+                return None;
+            }
+            self.done = true;
+            Some(Ok((Key::Static(StaticKey::msg), Value::String(self.bytes))))
+        }
+    }
+
+    let result = index.write(1, LogLevel::Info, SpanInfo::None, None, OversizedMsg { bytes: &too_large, done: false });
+
+    assert!(matches!(result, Err(MunchError::InvalidValue)));
+    assert_eq!(index.generation(), 0);
 }

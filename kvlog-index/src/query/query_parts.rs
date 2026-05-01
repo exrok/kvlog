@@ -13,8 +13,8 @@ mod literal;
 pub mod parser;
 mod range_eval;
 mod timestamp_eval;
-use crate::index::f48::{self, f48_to_f64, F48};
-use crate::index::{i48, Bucket, BucketGuard, Field, FieldKind, FieldKindSet, IntermentMaps, LogEntry};
+use crate::index::f60::{self, f60_to_f64, F60};
+use crate::index::{i60, Bucket, BucketGuard, Field, FieldKind, FieldKindSet, IntermentMaps, LogEntry};
 use crate::keyset::KeySet;
 use crate::shared_interner::Mapper;
 use literal::{EvalError, LiteralBinOp, LiteralParseError};
@@ -58,8 +58,8 @@ const fn type_set(mut kinds: &[FieldKind]) -> FieldKindBitSet {
     set
 }
 
-const ANY_FLOAT_TYPE: FieldKindBitSet = type_set(&[FieldKind::F48]);
-const ANY_INTEGER_TYPE: FieldKindBitSet = type_set(&[FieldKind::I48, FieldKind::I64, FieldKind::U64]);
+const ANY_FLOAT_TYPE: FieldKindBitSet = type_set(&[FieldKind::F60]);
+const ANY_INTEGER_TYPE: FieldKindBitSet = type_set(&[FieldKind::I60, FieldKind::I64, FieldKind::U64]);
 const ANY_NUMBER_TYPE: FieldKindBitSet = ANY_FLOAT_TYPE | ANY_INTEGER_TYPE;
 
 /// Note, ranges are inclusive.
@@ -86,7 +86,7 @@ pub enum FieldTest<'bump> {
     I64Eq(bool, i64),
     U64Eq(bool, u64),
     FloatRange { negated: bool, min: f64, max: f64 },
-    DurationRange { negated: bool, min_seconds: F48, max_seconds: F48 },
+    DurationRange { negated: bool, min_seconds: F60, max_seconds: F60 },
     TimeRange { negated: bool, min_ns: i64, max_ns: i64 },
 }
 
@@ -295,7 +295,7 @@ impl<'bump> FieldTest<'bump> {
                 return negated;
             }
             FieldTest::DurationRange { negated, min_seconds, max_seconds } => {
-                if let Some(value) = unsafe { field.as_raw_f48_seconds() } {
+                if let Some(value) = unsafe { field.as_raw_f60_seconds() } {
                     if value >= min_seconds && value <= max_seconds {
                         return !negated;
                     }
@@ -533,7 +533,7 @@ impl<'b> Pred<'b> {
                 return *negated;
             }
             Pred::HasSpan(negated) => {
-                if log.span_range().is_none() {
+                if log.span_range().is_some() {
                     return !*negated;
                 } else {
                     return *negated;
@@ -773,8 +773,8 @@ impl<'b> std::fmt::Debug for PredBuilder<'b> {
             Self::TimestampRange { negated, min_ns, max_ns } => f
                 .debug_struct("TimestampRange")
                 .field("negated", negated)
-                .field("min_ns", &f48_to_f64(*min_ns))
-                .field("max_ns", &f48_to_f64(*max_ns))
+                .field("min_ns", &f60_to_f64(*min_ns))
+                .field("max_ns", &f60_to_f64(*max_ns))
                 .finish(),
             Self::LevelMask(arg0, arg1) => f.debug_tuple("LevelMask").field(arg0).field(arg1).finish(),
             Self::Target(arg1) => f.debug_tuple("Target").field(arg1).finish(),
@@ -946,25 +946,23 @@ fn opt_copy_field_tes<'o>(
             }
         }
         FloatRange { negated, min, max } => {
-            if kinds == FieldKindSet::from(FieldKind::I48) {
+            if kinds == FieldKindSet::from(FieldKind::I60) {
                 return R::Ok(RangeRaw {
                     negated: *negated,
                     min: Field::new(
-                        key.0,
-                        FieldKind::I48,
-                        if *min < (i48::MIN as f64) { 0 } else { i48::from_i64(min.ceil() as i64) },
+                        FieldKind::I60,
+                        if *min < (i60::MIN as f64) { 0 } else { i60::from_i64(min.ceil() as i64) },
                     ),
                     max: Field::new(
-                        key.0,
-                        FieldKind::I48,
-                        if *max > (i48::MAX as f64) { (1u64 << 48) - 1 } else { i48::from_i64(max.floor() as i64) },
+                        FieldKind::I60,
+                        if *max > (i60::MAX as f64) { (1u64 << 60) - 1 } else { i60::from_i64(max.floor() as i64) },
                     ),
                 });
-            } else if kinds == FieldKindSet::from(FieldKind::F48) {
+            } else if kinds == FieldKindSet::from(FieldKind::F60) {
                 return R::Ok(RangeRaw {
                     negated: *negated,
-                    min: Field::new(key.0, FieldKind::F48, f48::f64_to_f48(*min)),
-                    max: Field::new(key.0, FieldKind::F48, f48::f64_to_f48(*max)),
+                    min: Field::new(FieldKind::F60, f60::f64_to_f60(*min)),
+                    max: Field::new(FieldKind::F60, f60::f64_to_f60(*max)),
                 });
             } else {
                 R::Ok(FloatRange { negated: *negated, min: *min, max: *max })
@@ -974,8 +972,8 @@ fn opt_copy_field_tes<'o>(
             if kinds.contains(FieldKind::Seconds) {
                 return R::Ok(RangeRaw {
                     negated: *negated,
-                    min: Field::new(key.0, FieldKind::Seconds, *min_seconds & ((1 << 48) - 1)),
-                    max: Field::new(key.0, FieldKind::Seconds, *max_seconds & ((1 << 48) - 1)),
+                    min: Field::new(FieldKind::Seconds, *min_seconds & ((1u64 << 60) - 1)),
+                    max: Field::new(FieldKind::Seconds, *max_seconds & ((1u64 << 60) - 1)),
                 });
             }
             if *negated {
@@ -988,8 +986,8 @@ fn opt_copy_field_tes<'o>(
             if kinds.contains(FieldKind::Timestamp) {
                 return R::Ok(RangeRaw {
                     negated: *negated,
-                    min: Field::new(key.0, FieldKind::Timestamp, (min_ns / 1_000_000).clamp(0, (1 << 48) - 1) as u64),
-                    max: Field::new(key.0, FieldKind::Timestamp, (max_ns / 1_000_000).clamp(0, (1 << 48) - 1) as u64),
+                    min: Field::new(FieldKind::Timestamp, (min_ns / 1_000_000).clamp(0, (1i64 << 60) - 1) as u64),
+                    max: Field::new(FieldKind::Timestamp, (max_ns / 1_000_000).clamp(0, (1i64 << 60) - 1) as u64),
                 });
             }
             if *negated {
@@ -1067,7 +1065,7 @@ impl<'b> PredBuilder<'b> {
                 return *negated;
             }
             PredBuilder::HasSpan(negated) => {
-                if log.span_range().is_none() {
+                if log.span_range().is_some() {
                     return !*negated;
                 } else {
                     return *negated;

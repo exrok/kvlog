@@ -106,8 +106,10 @@ unsafe impl Send for ServiceTable {}
 unsafe impl Sync for ServiceTable {}
 // static GLOBAL_SERVER_BUFFER: OnceLock<SharedIntermentBuffer> = OnceLock::new();
 
+pub const FIELD_LANES: usize = 24;
+
 #[derive(PartialOrd, Ord)]
-#[repr(C, align(8))]
+#[repr(C, align(64))]
 pub struct Archetype {
     pub(crate) msg_offset: u32,
     pub(crate) msg_len: u16,
@@ -118,8 +120,11 @@ pub struct Archetype {
     pub(crate) service: Option<ServiceId>,
     pub(crate) pad: u8,
     pub(crate) size: u16,
-    pub field_headers: [u16; 8],
+    pub field_headers: [u16; FIELD_LANES],
 }
+
+const _: () = assert!(std::mem::size_of::<Archetype>() == 64);
+const _: () = assert!(std::mem::align_of::<Archetype>() == 64);
 
 impl PartialEq for Archetype {
     fn eq(&self, other: &Self) -> bool {
@@ -137,6 +142,8 @@ impl std::hash::Hash for Archetype {
     }
 }
 
+const ARCHETYPE_RAW_WORDS: usize = std::mem::size_of::<Archetype>() / 8;
+
 impl Archetype {
     pub(crate) fn service(&self) -> Option<ServiceId> {
         self.service
@@ -152,48 +159,18 @@ impl Archetype {
     #[inline]
     pub(crate) fn field_keys(&self) -> &[KeyID] {
         unsafe {
-            std::slice::from_raw_parts(&self.field_headers as *const [u16; 8] as *const KeyID, self.size as usize)
+            std::hint::assert_unchecked(self.size as usize <= FIELD_LANES);
+            std::slice::from_raw_parts(self.field_headers.as_ptr() as *const KeyID, self.size as usize)
         }
     }
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse2", target_feature = "bmi2"))]
+    #[inline]
     pub fn index_of(&self, key: KeyID) -> Option<usize> {
-        let index =
-            unsafe { index_of_simd_single_match(&*(&self.field_headers as *const _ as *const [u64; 2]), key.raw()) };
-        if let Some(index) = index {
-            return unsafe { Some(index as usize) };
-        }
-
-        for (i, header) in self.field_keys().iter().skip(8).enumerate() {
-            if *header == key {
-                return unsafe { Some(i) };
-            }
-        }
-        None
-        // let mask = (index.0 as u64) << 52;
-        // for field in self.raw_fields() {
-        //     if field.raw < mask {
-        //         continue;
-        //     }
-        //     if field.raw ^ mask < ((1u64 << 53) - 1) {
-        //         return Some(*field);
-        //     }
-        //     return None;
-        // }
-        // return None;
+        lookup::index_of(&self.field_headers, key.raw()).map(|i| i as usize)
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2", target_feature = "bmi2")))]
-    pub fn index_of(&self, key: KeyID) -> Option<usize> {
-        for (i, header) in self.field_keys().iter().enumerate() {
-            if *header == key {
-                return unsafe { Some(i) };
-            }
-        }
-        None
-    }
-    pub(crate) fn as_raw(&self) -> &[u64; 4] {
-        unsafe { &*(self as *const Archetype as *const [u64; 4]) }
+    pub(crate) fn as_raw(&self) -> &[u64; ARCHETYPE_RAW_WORDS] {
+        unsafe { &*(self as *const Archetype as *const [u64; ARCHETYPE_RAW_WORDS]) }
     }
     pub fn level(&self) -> LogLevel {
         match self.mask & 0b1111 {
@@ -205,23 +182,20 @@ impl Archetype {
         }
     }
     pub fn contains_key(&self, key: KeyID) -> bool {
-        self.field_headers.contains(&key.0)
+        self.index_of(key).is_some()
     }
     // safetey: Bucket must be for Archetype of same generation
     pub unsafe fn print<'a>(&self, bucket: &BucketGuard<'a>) {
         unsafe {
             print!("{:?} `{}` [target: {}] [", self.level(), self.message(bucket).escape_ascii(), self.target_id);
             let mut output = false;
-            for key in self.field_headers {
-                if key == u16::MAX {
-                    continue;
-                }
+            for key in self.field_keys() {
                 if output {
                     print!(", ");
                 } else {
                     output = true;
                 }
-                let text = KeyID::try_raw_to_str(key).unwrap_or("UNKNOWN");
+                let text = KeyID::try_raw_to_str(key.0).unwrap_or("UNKNOWN");
                 print!("{text}");
             }
             println!("]");
@@ -243,20 +217,15 @@ impl Archetype {
         level: LogLevel,
         in_span: bool,
         service: Option<ServiceId>,
-        fields: &[Field],
+        field_keys: &[u16],
     ) -> Archetype {
+        debug_assert!(field_keys.len() <= FIELD_LANES);
         let mut mask = 1u32 << level as u8;
         if in_span {
             mask |= 1 << 4;
         }
-        let mut field_headers = [u16::MAX; 8];
-        for (i, field) in fields.iter().enumerate().take(8) {
-            let key = field.raw_key();
-            // let x1 = (key as u64).wrapping_mul(0x517cc1b727220a95) % 53;
-            // let x2 = (key as u64) % 53;
-            // mask |= 0b1_0_0000 << x1;
-            // mask |= 0b1_0_0000 << x2;
-            //todo add kind so we can do even more pre-querying???
+        let mut field_headers = [u16::MAX; FIELD_LANES];
+        for (i, key) in field_keys.iter().copied().enumerate() {
             field_headers[i] = key;
         }
         Archetype {
@@ -266,8 +235,71 @@ impl Archetype {
             mask,
             service,
             pad: 0,
-            size: fields.len().min(8) as u16,
+            size: field_keys.len() as u16,
             field_headers,
+        }
+    }
+}
+
+pub(crate) mod lookup {
+    use super::FIELD_LANES;
+
+    /// Returns the index of `key` within `headers`, or `None` if absent.
+    ///
+    /// `headers` is expected to have unused tail slots filled with `u16::MAX`
+    /// (see `Archetype::new`). Real `KeyID`s never reach `u16::MAX`, so the
+    /// search runs over the full array; if the invariant is violated the
+    /// function may return a wrong index but stays memory-safe.
+    ///
+    /// On AVX2 + BMI2 a single 256-bit + 128-bit packed compare wins; on
+    /// every other target a fully-unrolled branch-free binary search wins,
+    /// because the SSE2 `movemask` -> `tzcnt` dependency chain is longer
+    /// than ceil(log_2 24) = 5 `cmp; cmov` steps for a non-batched
+    /// single-key lookup.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    #[inline(always)]
+    pub fn index_of(headers: &[u16; FIELD_LANES], key: u16) -> Option<u32> {
+        use core::arch::x86_64::*;
+        // Intrinsics are `unsafe fn` because they require their named target
+        // features; the cfg gate above guarantees those are enabled at compile
+        // time. The two unaligned loads cover the full 48-byte `headers` array
+        // (32 from `p`, 16 more from `p.add(1)`), so there is no OOB read.
+        unsafe {
+            let p = headers.as_ptr() as *const __m256i;
+            let kv256 = _mm256_set1_epi16(key as i16);
+            let kv128 = _mm_set1_epi16(key as i16);
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi16(_mm256_loadu_si256(p), kv256)) as u32 as u64;
+            let hi =
+                _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_loadu_si128(p.add(1) as *const __m128i), kv128)) as u32 as u64;
+            let mask = lo | (hi << 32);
+            if mask == 0 {
+                None
+            } else {
+                Some((_tzcnt_u64(mask) >> 1) as u32)
+            }
+        }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+    #[inline(always)]
+    pub fn index_of(headers: &[u16; FIELD_LANES], key: u16) -> Option<u32> {
+        let mut base: usize = 0;
+        let mut len: usize = FIELD_LANES;
+        // Loop invariant: base + len <= FIELD_LANES, so `mid = base + half`
+        // with `half < len` is always < FIELD_LANES, and after the loop
+        // `len >= 1` so `base < FIELD_LANES`. The unchecked indexing is sound.
+        while len > 1 {
+            let half = len / 2;
+            let mid = base + half;
+            let v = unsafe { *headers.get_unchecked(mid) };
+            base = if v <= key { mid } else { base };
+            len -= half;
+        }
+        let v = unsafe { *headers.get_unchecked(base) };
+        if v == key {
+            Some(base as u32)
+        } else {
+            None
         }
     }
 }

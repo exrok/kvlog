@@ -7,10 +7,7 @@ pub struct TimeFilter {
 }
 impl Default for TimeFilter {
     fn default() -> Self {
-        Self {
-            min_utc_ns: u64::MIN,
-            max_utc_ns: u64::MAX,
-        }
+        Self { min_utc_ns: u64::MIN, max_utc_ns: u64::MAX }
     }
 }
 impl TimeFilter {
