@@ -14,7 +14,14 @@ pub const STREAM_HEADER_MAGIC: [u8; 4] = *b"KVBL";
 pub const STREAM_FOOTER_MAGIC: [u8; 4] = *b"KVBE";
 
 /// Current stream format version.
-pub const STREAM_VERSION: u8 = 1;
+///
+/// History:
+/// - v1: initial.
+/// - v2: SpanDecl payload gained a trailing uvarint `flags` field
+///   (currently `SPAN_FLAG_FROM_PREVIOUS_BUCKET`). Older streams replay as
+///   `flags = 0` because the trailing field, when absent, is treated as
+///   zero by the decoder.
+pub const STREAM_VERSION: u8 = 2;
 
 /// Byte length of the file header.
 pub const STREAM_HEADER_LEN: usize = 16;
@@ -45,7 +52,10 @@ pub enum FrameTag {
     /// `[u8 service_id][uvarint len][utf8 name]`. Declares a service id.
     ServiceDecl = 0x06,
     /// `[uvarint span_id][8 bytes SpanID][u8 has_parent][optional 8 bytes
-    /// parent SpanID]`. Declares a span at a sequential span id.
+    /// parent SpanID][uvarint flags]`. Declares a span at a sequential span
+    /// id. The trailing `flags` field carries `SPAN_FLAG_*` bits and was
+    /// added in stream v2; v1 streams omit it and are decoded as
+    /// `flags = 0`.
     SpanDecl = 0x07,
     /// Archetype declaration. See [`Self::Record`] for the field layout.
     /// `[u8 level][u8 flags: bit0=has_span][uvarint service_id_or_0]

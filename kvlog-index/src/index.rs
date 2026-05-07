@@ -313,25 +313,93 @@ fn system_time_now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
+/// Sentinel value for `SpanRange::parent_index` meaning "no resolvable parent
+/// in this bucket". Used when the span is a root, when cross-bucket
+/// replication hit the depth cap, or when the parent is not present in any
+/// live bucket.
+pub const SPAN_PARENT_INDEX_NONE: u32 = u32::MAX;
+
+/// Sentinel value for `SpanRange::first_mask` and `SpanRange::last_mask`
+/// meaning "no record on this span in this bucket yet". Used for SpanRanges
+/// allocated as cross-bucket parent stubs. The first record landing on the
+/// stub claims `first_mask` via a CAS from this sentinel, then stores the
+/// real value into `last_mask`.
+///
+/// `u32::MAX` is reserved (rather than `0`) because `first_mask = 0` is a
+/// legitimate value for a span whose first record is a Current at log index
+/// 0, and that case must remain distinguishable.
+pub const SPAN_MASK_NONE: u32 = u32::MAX;
+
+/// Set on `SpanRange::flags` when the span has data in a previous bucket as
+/// well — either because it was replicated into this bucket as a
+/// cross-bucket parent stub, or because records for it span across bucket
+/// boundaries. The flag is **set once at allocation and never cleared**,
+/// even after records for the span land in this bucket. Its absence is a
+/// query optimization signal: queries spanning a single span need not look
+/// in older buckets when this flag is unset.
+pub const SPAN_FLAG_FROM_PREVIOUS_BUCKET: u32 = 1 << 0;
+
+/// Maximum depth of cross-bucket parent replication. When a span is first
+/// observed in a bucket and its parent lives in an older bucket, ancestors
+/// are replicated up to this many levels deep. Beyond this, `parent_index`
+/// is set to [`SPAN_PARENT_INDEX_NONE`] and chain walking stops.
+pub const MAX_CROSS_BUCKET_PARENT_DEPTH: usize = 8;
+
+/// Per-span metadata in a bucket.
+///
+/// Initialization is one-shot: every non-atomic field (`id`, `parent`,
+/// `parent_index`, `flags`) is written exactly once at allocation and never
+/// modified afterwards. `first_mask` and `last_mask` are atomic and may be
+/// updated by the ingest thread after publication. Concurrent readers thus
+/// observe stable non-atomic data and atomically-updated mask data.
 #[derive(Debug)]
 #[repr(C)]
 pub struct SpanRange {
     pub id: SpanID,
     pub parent: Option<SpanID>,
-    // 32nd bit indicates this entry was a Start Span
-    pub first_mask: u32,
-    // 32nd bit indicates this entry was a End Span
+    /// Local index into the same bucket's `span_data` of this span's parent
+    /// SpanRange, or [`SPAN_PARENT_INDEX_NONE`] when no parent edge is
+    /// available in this bucket.
+    pub parent_index: u32,
+    /// Index of the first record on this span in the current bucket. Bit 31
+    /// is set when that record was a Start. [`SPAN_MASK_NONE`] is the
+    /// "stub, no record yet" sentinel for cross-bucket parent placeholders.
+    pub first_mask: AtomicU32,
+    /// Index of the last record on this span in the current bucket. Bit 31
+    /// is set when that record was an End. [`SPAN_MASK_NONE`] mirrors the
+    /// stub sentinel.
     pub last_mask: AtomicU32,
+    /// Bitfield of `SPAN_FLAG_*` constants. Set at allocation time and
+    /// never mutated afterwards.
+    pub flags: u32,
 }
+const _: () = assert!(std::mem::size_of::<SpanRange>() == 32);
 impl SpanRange {
     fn index_range(&self) -> std::ops::Range<u32> {
-        (self.first_mask & 0x7FFF_FFFF)..((self.last_mask.load(Ordering::Relaxed) & 0x7FFF_FFFF) + 1)
+        let first = self.first_mask.load(Ordering::Acquire);
+        if first == SPAN_MASK_NONE {
+            return 0..0;
+        }
+        let last = self.last_mask.load(Ordering::Relaxed);
+        if last == SPAN_MASK_NONE {
+            return 0..0;
+        }
+        (first & 0x7FFF_FFFF)..((last & 0x7FFF_FFFF) + 1)
     }
     fn true_index_range(&self) -> std::ops::Range<u32> {
-        (self.first_mask & 0x7FFF_FFFF)..(self.last_mask.load(Ordering::Relaxed) & 0x7FFF_FFFF)
+        let first = self.first_mask.load(Ordering::Acquire);
+        if first == SPAN_MASK_NONE {
+            return 0..0;
+        }
+        let last = self.last_mask.load(Ordering::Relaxed);
+        if last == SPAN_MASK_NONE {
+            return 0..0;
+        }
+        (first & 0x7FFF_FFFF)..(last & 0x7FFF_FFFF)
     }
     pub fn span_info(&self, entry: u32) -> SpanInfo {
-        if self.first_mask ^ entry == (1u32 << 31) {
+        let first = self.first_mask.load(Ordering::Acquire);
+        if first != SPAN_MASK_NONE && first ^ entry == (1u32 << 31) {
             SpanInfo::Start { span: self.id, parent: self.parent }
         } else if self.last_mask.load(Ordering::Acquire) ^ entry == (1u32 << 31) {
             SpanInfo::End { span: self.id }
@@ -339,6 +407,25 @@ impl SpanRange {
             SpanInfo::Current { span: self.id }
         }
     }
+    /// True when records for this span exist in a previous bucket. Set on
+    /// cross-bucket parent stubs at allocation time and persistent
+    /// thereafter. Absence is a query-optimization hint: a query bounded to
+    /// this span need not search older buckets.
+    pub fn from_previous_bucket(&self) -> bool {
+        self.flags & SPAN_FLAG_FROM_PREVIOUS_BUCKET != 0
+    }
+}
+
+/// Location of a `SpanRange` across the rotating bucket array. The map
+/// `Index::span_table` keeps the most recent location per `SpanID`, retained
+/// across bucket rotations as long as the referenced bucket is still live.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SpanRangeIndex {
+    /// Generation of the bucket holding this SpanRange. Compared against the
+    /// bucket's `generation` atomic to detect rotation.
+    pub generation: u32,
+    /// Index into the bucket's `span_data` column.
+    pub index: u32,
 }
 #[repr(C)]
 struct TimeRange {
@@ -623,6 +710,31 @@ impl<'a> LogEntry<'a> {
         } else {
             None
         }
+    }
+    /// Walk the parent chain for this entry's span, root-first, excluding the
+    /// entry's own span. Resolution stays inside the current bucket using
+    /// each `SpanRange`'s `parent_index`. Live ingest replicates ancestors
+    /// across bucket boundaries up to [`MAX_CROSS_BUCKET_PARENT_DEPTH`]
+    /// levels, so older roots may be unavailable.
+    ///
+    /// `max_depth` caps the walk independently of the replication depth and
+    /// also acts as a safety bound against malformed cycles.
+    pub fn ancestor_chain(&self, max_depth: usize) -> SmallVec<[SpanID; 16]> {
+        let mut chain: SmallVec<[SpanID; 16]> = SmallVec::new();
+        let Some(start) = self.span_range() else {
+            return chain;
+        };
+        let mut idx = start.parent_index;
+        for _ in 0..max_depth {
+            if idx == SPAN_PARENT_INDEX_NONE {
+                break;
+            }
+            let sr = unsafe { &*self.bucket.span_data.as_ptr().add(idx as usize) };
+            chain.push(sr.id);
+            idx = sr.parent_index;
+        }
+        chain.reverse();
+        chain
     }
     pub fn span_info(&self) -> SpanInfo {
         if let Some(range) = self.span_range() {
@@ -1252,6 +1364,40 @@ impl IndexReader {
 //     fn upgrade(&self, weak: WeakLogEntry) -> LogEntry<'a> {}
 // }
 
+/// Allocate a fresh slot in the bucket's `span_data` and write a SpanRange
+/// to it. Returns the slot index, or `None` when the bucket has no
+/// SpanRange capacity left. `parent_index` starts at
+/// [`SPAN_PARENT_INDEX_NONE`]; the caller patches it once the parent's
+/// slot is known. Free function (rather than a method) so callers can split
+/// borrows: this only mutates `spans_used` and writes to `bucket.span_data`,
+/// leaving `Index::span_table` available for entry-API mutation.
+fn allocate_span_slot(
+    spans_used: &mut usize,
+    bucket: &Bucket,
+    id: SpanID,
+    parent: Option<SpanID>,
+    first_mask: u32,
+    last_mask: u32,
+    flags: u32,
+) -> Option<u32> {
+    if *spans_used >= BUCKET_SPAN_RANGE_SIZE {
+        return None;
+    }
+    let slot = *spans_used as u32;
+    *spans_used += 1;
+    unsafe {
+        bucket.span_data.as_ptr().add(slot as usize).write(SpanRange {
+            id,
+            parent,
+            parent_index: SPAN_PARENT_INDEX_NONE,
+            first_mask: AtomicU32::new(first_mask),
+            last_mask: AtomicU32::new(last_mask),
+            flags,
+        });
+    }
+    Some(slot)
+}
+
 unsafe fn mmap_alloc<T: Sized>(amount: usize) -> NonNull<T> {
     let raw = unsafe {
         libc::mmap(
@@ -1345,7 +1491,7 @@ pub struct Index {
     msg_map: HashTable<InternedRange>,
     target_map: LocalIntermentCache,
     uuid_intern_map: HashTable<u32>,
-    span_table: HashMap<SpanID, u32>,
+    span_table: HashMap<SpanID, SpanRangeIndex>,
     new_ranges: Vec<(InternedRange, u64)>,
     new_uuids: Vec<(u32, u64)>,
     dirty: bool,
@@ -1422,11 +1568,20 @@ impl Index {
         self.uuid_intern_map.clear();
         self.archetype_map.clear();
         self.msg_map.clear();
-        self.span_table.clear();
+        // span_table is retained across rotations: it holds entries for all
+        // live buckets so cross-bucket parent lookups stay O(1). Stale
+        // entries pointing at the bucket we are about to rotate out are
+        // dropped below, after `self.generation` is bumped.
         self.new_ranges.clear();
         self.new_uuids.clear();
         self.dirty = false;
         self.generation += 1;
+        // Drop span_table entries pointing at the bucket about to be reused.
+        // The new active generation is `self.generation`; the bucket index
+        // `self.generation & 0b11` previously held generation
+        // `self.generation - BUCKET_COUNT`, which is no longer addressable.
+        let oldest_live_generation = (self.generation as u32).saturating_sub(BUCKET_COUNT as u32 - 1);
+        self.span_table.retain(|_, loc| loc.generation >= oldest_live_generation);
 
         let bucket = &self.reader.buckets[self.generation & 0b11];
         bucket.len.store(0, Ordering::Release);
@@ -1693,32 +1848,227 @@ impl Index {
         self.target_map.intern(&self.reader.targets, name)
     }
 
+    /// Install or update a SpanRange for a live ingest record. Returns the
+    /// span's local slot in the current bucket, or `None` when the bucket
+    /// has run out of SpanRange capacity.
+    ///
+    /// The leaf span is handled in a single `entry` lookup. New SpanRanges
+    /// are allocated child-first: leaf at the lowest new slot, then each
+    /// replicated ancestor at the next slot up. Each step patches the
+    /// previous slot's `parent_index` to point at the freshly allocated
+    /// parent, so all `parent_index` values are correct by the time this
+    /// function returns.
+    ///
+    /// # Invariant
+    ///
+    /// The slot range allocated by a single call to this function always
+    /// forms a single ancestor chain ordered child-at-low-slot,
+    /// root-at-high-slot. The persistence encoder relies on this to emit
+    /// each record's batch in reverse slot order so replay observes parents
+    /// before children within the batch (see `persistence::encoder::record`).
+    fn install_live_span(
+        &mut self,
+        span: SpanID,
+        span_parent: Option<SpanID>,
+        span_info: &SpanInfo,
+        start_mask: u32,
+        end_mask: u32,
+    ) -> Result<Option<u32>, MunchError> {
+        use hashbrown::hash_map::Entry;
+        let cur_gen = self.generation as u32;
+        let logs_used = self.logs_used as u32;
+        // Split borrows: span_table is held mutably through Entry, while
+        // bucket arrays and spans_used are accessed independently. The
+        // compiler accepts disjoint field borrows when bound to locals.
+        let buckets = &self.reader.buckets;
+        let bucket = &buckets[self.generation & 0b11];
+        let span_table = &mut self.span_table;
+        let spans_used = &mut self.spans_used;
+
+        let (leaf_slot, first_parent) = match span_table.entry(span) {
+            Entry::Occupied(mut entry) => {
+                let loc = *entry.get();
+                if loc.generation == cur_gen {
+                    // Same bucket: refresh masks. Non-atomic SpanRange
+                    // fields are immutable post-publication; only first_mask
+                    // and last_mask may change, and only via atomic ops.
+                    //
+                    // For Start records, first_mask is stored
+                    // unconditionally so the Start designation wins over
+                    // any prior Current placeholder. For Current/End, a
+                    // CAS from `SPAN_MASK_NONE` claims first_mask only on
+                    // the first record landing on a cross-bucket parent
+                    // stub; once first_mask holds a real value the CAS
+                    // fails and only last_mask is updated.
+                    //
+                    // The `SPAN_FLAG_FROM_PREVIOUS_BUCKET` bit on `flags`
+                    // is intentionally **not** cleared: it is a permanent
+                    // marker that records for this span exist in a
+                    // previous bucket too.
+                    let sr = unsafe { &*bucket.span_data.as_ptr().add(loc.index as usize) };
+                    if start_mask != 0 {
+                        sr.first_mask.store(logs_used | start_mask, Ordering::Release);
+                    } else {
+                        let _ = sr.first_mask.compare_exchange(
+                            SPAN_MASK_NONE,
+                            logs_used,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    sr.last_mask.store(logs_used | end_mask, Ordering::Release);
+                    return Ok(Some(loc.index));
+                }
+                // Cross-bucket: SpanInfo::Start carries the parent explicitly,
+                // anything else inherits from the existing record.
+                let actual_parent = match span_info {
+                    SpanInfo::Start { .. } => span_parent,
+                    _ => {
+                        let old_bucket = &buckets[(loc.generation & 0b11) as usize];
+                        if old_bucket.generation.load(Ordering::Acquire) == loc.generation {
+                            unsafe { (*old_bucket.span_data.as_ptr().add(loc.index as usize)).parent }
+                        } else {
+                            None
+                        }
+                    }
+                };
+                // Cross-bucket: this span has records in a previous bucket,
+                // so set SPAN_FLAG_FROM_PREVIOUS_BUCKET. The flag is
+                // permanent across this bucket's lifetime.
+                let Some(slot) = allocate_span_slot(
+                    spans_used, bucket, span, actual_parent,
+                    logs_used | start_mask, logs_used | end_mask,
+                    SPAN_FLAG_FROM_PREVIOUS_BUCKET,
+                ) else {
+                    return Ok(None);
+                };
+                entry.insert(SpanRangeIndex { generation: cur_gen, index: slot });
+                (slot, actual_parent)
+            }
+            Entry::Vacant(entry) => {
+                // Brand-new span: no prior-bucket data, flags = 0. Queries
+                // bounded to this span do not need to search older buckets.
+                let actual_parent = if let SpanInfo::Start { .. } = span_info { span_parent } else { None };
+                let Some(slot) = allocate_span_slot(
+                    spans_used, bucket, span, actual_parent,
+                    logs_used | start_mask, logs_used | end_mask, 0,
+                ) else {
+                    return Ok(None);
+                };
+                entry.insert(SpanRangeIndex { generation: cur_gen, index: slot });
+                (slot, actual_parent)
+            }
+        };
+
+        // Walk the parent chain iteratively. Each step either finds the
+        // parent already in this bucket (and patches the child's
+        // `parent_index`) or replicates it from an older bucket and
+        // continues with the grandparent. Single hash op per ancestor via
+        // the entry API.
+        let mut child_slot = leaf_slot;
+        let mut next_parent = first_parent;
+        for _ in 0..MAX_CROSS_BUCKET_PARENT_DEPTH {
+            let Some(parent_id) = next_parent else { break };
+            match span_table.entry(parent_id) {
+                Entry::Vacant(entry) => {
+                    // The parent is unknown to every live bucket. Install a
+                    // stub so the SpanID is reachable, then stop walking.
+                    // Masks are set to SPAN_MASK_NONE; if a record for this
+                    // span later lands in this bucket, the same-bucket path
+                    // claims first_mask via CAS and stores last_mask.
+                    let Some(slot) = allocate_span_slot(
+                        spans_used, bucket, parent_id, None,
+                        SPAN_MASK_NONE, SPAN_MASK_NONE,
+                        SPAN_FLAG_FROM_PREVIOUS_BUCKET,
+                    ) else {
+                        break;
+                    };
+                    entry.insert(SpanRangeIndex { generation: cur_gen, index: slot });
+                    unsafe {
+                        let child_sr = bucket.span_data.as_ptr().add(child_slot as usize) as *mut SpanRange;
+                        (*child_sr).parent_index = slot;
+                    }
+                    break;
+                }
+                Entry::Occupied(mut entry) => {
+                    let loc = *entry.get();
+                    if loc.generation == cur_gen {
+                        unsafe {
+                            let child_sr = bucket.span_data.as_ptr().add(child_slot as usize) as *mut SpanRange;
+                            (*child_sr).parent_index = loc.index;
+                        }
+                        break;
+                    }
+                    let old_bucket = &buckets[(loc.generation & 0b11) as usize];
+                    if old_bucket.generation.load(Ordering::Acquire) != loc.generation {
+                        break;
+                    }
+                    let grandparent = unsafe { (*old_bucket.span_data.as_ptr().add(loc.index as usize)).parent };
+                    // Replicated stub: masks are SPAN_MASK_NONE until a
+                    // record for this span lands in the current bucket.
+                    let Some(slot) = allocate_span_slot(
+                        spans_used, bucket, parent_id, grandparent,
+                        SPAN_MASK_NONE, SPAN_MASK_NONE,
+                        SPAN_FLAG_FROM_PREVIOUS_BUCKET,
+                    ) else {
+                        break;
+                    };
+                    entry.insert(SpanRangeIndex { generation: cur_gen, index: slot });
+                    unsafe {
+                        let child_sr = bucket.span_data.as_ptr().add(child_slot as usize) as *mut SpanRange;
+                        (*child_sr).parent_index = slot;
+                    }
+                    child_slot = slot;
+                    next_parent = grandparent;
+                }
+            }
+        }
+
+        Ok(Some(leaf_slot))
+    }
+
     /// Install a SpanDecl: write the SpanRange to bucket.span_data and insert
-    /// into span_table.
+    /// into span_table. Resolves `parent_index` against any parent slot
+    /// already declared in this bucket. The encoder emits each record's
+    /// SpanDecl batch in reverse slot order so a parent referenced here is
+    /// always declared earlier in the same stream and resides in the
+    /// current bucket. `flags` round-trips the bucket-local SpanRange
+    /// flags (notably `SPAN_FLAG_FROM_PREVIOUS_BUCKET`).
     pub(crate) fn install_span_decl(
         &mut self,
         span_id: u32,
         span: SpanID,
         parent: Option<SpanID>,
+        flags: u32,
     ) -> Result<(), crate::persistence::format::ReadError> {
         if (span_id as usize) >= BUCKET_SPAN_RANGE_SIZE {
             return Err(crate::persistence::format::ReadError::BucketCapacityExceeded);
         }
+        let cur_gen = self.generation as u32;
+        let parent_index = match parent {
+            Some(p) => match self.span_table.get(&p) {
+                Some(loc) if loc.generation == cur_gen => loc.index,
+                _ => SPAN_PARENT_INDEX_NONE,
+            },
+            None => SPAN_PARENT_INDEX_NONE,
+        };
         let bucket = &self.reader.buckets[self.generation & 0b11];
-        // Initialize first_mask/last_mask to 0; the Record frame will update them
-        // based on the span_kind reported per record.
+        // Initialize first_mask/last_mask to the SPAN_MASK_NONE sentinel.
+        // The Record frame will claim them via atomic stores in install_record.
         unsafe {
             bucket.span_data.as_ptr().add(span_id as usize).write(SpanRange {
                 id: span,
                 parent,
-                first_mask: 0,
-                last_mask: AtomicU32::new(0),
+                parent_index,
+                first_mask: AtomicU32::new(SPAN_MASK_NONE),
+                last_mask: AtomicU32::new(SPAN_MASK_NONE),
+                flags,
             });
         }
         if (span_id as usize) >= self.spans_used {
             self.spans_used = (span_id as usize) + 1;
         }
-        self.span_table.insert(span, span_id);
+        self.span_table.insert(span, SpanRangeIndex { generation: cur_gen, index: span_id });
         Ok(())
     }
 
@@ -1824,19 +2174,33 @@ impl Index {
                 let sr = unsafe { &*bucket.span_data.as_ptr().add(sid as usize) };
                 let raw_index = log_index as u32;
                 use crate::persistence::format::SpanKindTag;
+                // Update masks via atomic stores. Non-atomic fields (id,
+                // parent, parent_index, flags) were finalized when
+                // install_span_decl wrote this slot and are immutable here.
+                // first_mask is `SPAN_MASK_NONE` until the first record on
+                // this span lands; from then on it holds the first record's
+                // index (with bit 31 set if it was a Start).
                 match kind {
-                    SpanKindTag::StartWithParent | SpanKindTag::Start => unsafe {
-                        (bucket.span_data.as_ptr().add(sid as usize) as *mut SpanRange).write(SpanRange {
-                            id: sr.id,
-                            parent: sr.parent,
-                            first_mask: raw_index | (1u32 << 31),
-                            last_mask: AtomicU32::new(raw_index),
-                        });
-                    },
+                    SpanKindTag::StartWithParent | SpanKindTag::Start => {
+                        sr.first_mask.store(raw_index | (1u32 << 31), Ordering::Release);
+                        sr.last_mask.store(raw_index, Ordering::Release);
+                    }
                     SpanKindTag::Current => {
+                        let _ = sr.first_mask.compare_exchange(
+                            SPAN_MASK_NONE,
+                            raw_index,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
                         sr.last_mask.store(raw_index, Ordering::Release);
                     }
                     SpanKindTag::End => {
+                        let _ = sr.first_mask.compare_exchange(
+                            SPAN_MASK_NONE,
+                            raw_index,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
                         sr.last_mask.store(raw_index | (1u32 << 31), Ordering::Release);
                     }
                 }
@@ -1954,7 +2318,9 @@ impl Index {
         let log_index = (self.logs_used - 1) as u32;
         let bucket = &self.reader.buckets[self.generation & 0b11];
         let msg_count = self.msg_map.len();
-        let span_count = self.span_table.len();
+        // Use the per-bucket spans_used count rather than span_table.len(),
+        // which now retains entries across rotated-out buckets.
+        let span_count = self.spans_used;
         let new_ranges: &[_] = &self.new_ranges;
         let new_uuids: &[_] = &self.new_uuids;
         let msg_map = &self.msg_map;
@@ -2144,40 +2510,16 @@ impl Index {
             }
             SpanInfo::None => None,
         };
-        if let Some(span) = span {
-            use hashbrown::hash_map::Entry;
-            let span_index = match self.span_table.entry(span) {
-                Entry::Occupied(entry) => {
-                    let id = *entry.get();
-                    let span_range = unsafe { &*bucket.span_data.as_ptr().add(id as usize) };
-                    span_range.last_mask.store((self.logs_used as u32) | end_mask, Ordering::Release);
-                    id
-                }
-                Entry::Vacant(entry) => {
-                    let id = self.spans_used as u32;
-                    entry.insert(id);
-                    if self.spans_used >= BUCKET_SPAN_RANGE_SIZE {
-                        return Ok(false);
-                    }
-                    self.spans_used += 1;
-                    unsafe {
-                        bucket.span_data.as_ptr().add(id as usize).write(SpanRange {
-                            id: span,
-                            parent: span_parent,
-                            first_mask: (self.logs_used as u32) | start_mask,
-                            last_mask: AtomicU32::new((self.logs_used as u32) | end_mask),
-                        })
-                    };
-                    id
-                }
-            };
-            unsafe {
-                bucket.span_index.as_ptr().add(self.logs_used).write(span_index);
-            }
-        } else {
-            unsafe {
-                bucket.span_index.as_ptr().add(self.logs_used).write(u32::MAX);
-            }
+        let span_index = match span {
+            Some(span) => match self.install_live_span(span, span_parent, &span_info, start_mask, end_mask)? {
+                Some(idx) => idx,
+                None => return Ok(false),
+            },
+            None => u32::MAX,
+        };
+        let bucket = &self.reader.buckets[self.generation & 0b11];
+        unsafe {
+            bucket.span_index.as_ptr().add(self.logs_used).write(span_index);
         }
         self.chunk_min_utc_ns = timestamp.min(self.chunk_min_utc_ns);
         self.chunk_max_utc_ns = timestamp.max(self.chunk_max_utc_ns);

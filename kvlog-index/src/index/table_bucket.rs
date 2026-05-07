@@ -974,8 +974,16 @@ fn validate_field(field: Field, data: &[u8]) -> Result<(), SnapshotLoadError> {
 
 fn validate_spans(spans: &[SpanRange], log_count: usize) -> Result<(), SnapshotLoadError> {
     for span in spans {
-        let first = span.first_mask & 0x7FFF_FFFF;
-        let last = span.last_mask.load(Ordering::Relaxed) & 0x7FFF_FFFF;
+        let first_raw = span.first_mask.load(Ordering::Relaxed);
+        let last_raw = span.last_mask.load(Ordering::Relaxed);
+        // Cross-bucket parent stubs carry the SPAN_MASK_NONE sentinel and
+        // have no records in this bucket; they don't have a meaningful
+        // range to range-check.
+        if first_raw == crate::index::SPAN_MASK_NONE || last_raw == crate::index::SPAN_MASK_NONE {
+            continue;
+        }
+        let first = first_raw & 0x7FFF_FFFF;
+        let last = last_raw & 0x7FFF_FFFF;
         if first as usize >= log_count || last as usize >= log_count || first > last {
             return Err(SnapshotLoadError::InvalidSpan);
         }

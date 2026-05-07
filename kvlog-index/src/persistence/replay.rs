@@ -138,8 +138,11 @@ pub fn ingest(index: &mut Index, bytes: &[u8]) -> Result<u64, ReadError> {
                 } else {
                     None
                 };
+                // `flags` was added in stream v2. v1 streams have no
+                // trailing bytes here; treat absent flags as 0.
+                let flags = if p.is_empty() { 0 } else { read_uvarint(&mut p)? as u32 };
                 let span = NonZeroU64::new(span_full).map(SpanID::from).ok_or(ReadError::UnknownSpanId)?;
-                index.install_span_decl(span_id, span, parent)?;
+                index.install_span_decl(span_id, span, parent, flags)?;
             }
             FrameTag::ArchetypeDecl => {
                 let level_mask = read_u8(&mut p)?;

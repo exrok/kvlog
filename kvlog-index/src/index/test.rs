@@ -401,6 +401,141 @@ fn rollover_reinterns_message_in_new_bucket() {
     assert_eq!(entry.message(), b"repeat");
 }
 
+fn span_id_for(value: u64) -> kvlog::SpanID {
+    kvlog::SpanID::from(std::num::NonZeroU64::new(value).unwrap())
+}
+
+#[test]
+fn ancestor_chain_walks_within_bucket() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0xA0);
+    let mid = span_id_for(0xA1);
+    let leaf = span_id_for(0xA2);
+
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "root");
+    log!(writer; { span: SpanInfo::Start { span: mid, parent: Some(root) } } msg = "mid");
+    let leaf_entry = log!(writer;
+        { span: SpanInfo::Start { span: leaf, parent: Some(mid) } } msg = "leaf");
+
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(leaf_entry).unwrap();
+    let chain = entry.ancestor_chain(super::MAX_CROSS_BUCKET_PARENT_DEPTH);
+    assert_eq!(chain.as_slice(), &[root, mid]);
+}
+
+#[test]
+fn ancestor_chain_replicates_across_bucket_rotation() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0xB0);
+    let mid = span_id_for(0xB1);
+    let leaf = span_id_for(0xB2);
+
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "root");
+    log!(writer; { span: SpanInfo::Start { span: mid, parent: Some(root) } } msg = "mid");
+    log!(writer; { span: SpanInfo::Start { span: leaf, parent: Some(mid) } } msg = "leaf-bucket0");
+    writer.index.complete_bucket();
+
+    // New bucket: a Current record on `leaf` should replicate the chain.
+    let next_entry = log!(writer; { span: SpanInfo::Current { span: leaf } } msg = "leaf-bucket1");
+
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(next_entry).unwrap();
+    let chain = entry.ancestor_chain(super::MAX_CROSS_BUCKET_PARENT_DEPTH);
+    assert_eq!(chain.as_slice(), &[root, mid]);
+
+    // Replicated ancestors should be flagged.
+    let mid_range = entry.span_range().unwrap();
+    let parent_idx = mid_range.parent_index;
+    assert_ne!(parent_idx, super::SPAN_PARENT_INDEX_NONE);
+    let parent_sr = unsafe { &*entry.bucket().span_data.as_ptr().add(parent_idx as usize) };
+    assert!(parent_sr.from_previous_bucket());
+}
+
+#[test]
+fn ancestor_chain_truncates_at_replication_depth() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    // Build a deeper chain than MAX_CROSS_BUCKET_PARENT_DEPTH allows.
+    let depth = super::MAX_CROSS_BUCKET_PARENT_DEPTH + 4;
+    let spans: Vec<_> = (0..depth).map(|i| span_id_for(0x100 + i as u64)).collect();
+    log!(writer; { span: SpanInfo::Start { span: spans[0], parent: None } } msg = "root");
+    for i in 1..depth {
+        log!(writer; { span: SpanInfo::Start { span: spans[i], parent: Some(spans[i - 1]) } } msg = "n");
+    }
+    writer.index.complete_bucket();
+    let leaf_entry = log!(writer; { span: SpanInfo::Current { span: spans[depth - 1] } } msg = "leaf");
+
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(leaf_entry).unwrap();
+    let chain = entry.ancestor_chain(64);
+    // Replication caps at MAX_CROSS_BUCKET_PARENT_DEPTH levels.
+    assert_eq!(chain.len(), super::MAX_CROSS_BUCKET_PARENT_DEPTH);
+}
+
+#[test]
+fn cross_bucket_stub_keeps_flag_after_record_lands() {
+    // A span replicated as a cross-bucket parent stub keeps the
+    // FROM_PREVIOUS_BUCKET flag even after a real record for that span
+    // lands in the current bucket. Promotion only updates the atomic
+    // mask fields; non-atomic fields stay as initialized.
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let parent = span_id_for(0xD0);
+    let child = span_id_for(0xD1);
+
+    log!(writer; { span: SpanInfo::Start { span: parent, parent: None } } msg = "p");
+    log!(writer; { span: SpanInfo::Start { span: child, parent: Some(parent) } } msg = "c");
+    writer.index.complete_bucket();
+
+    // New bucket: a record on `child` first replicates `parent` as a
+    // stub. Then a record on `parent` itself promotes that stub.
+    log!(writer; { span: SpanInfo::Current { span: child } } msg = "c2");
+    let parent_record = log!(writer; { span: SpanInfo::Current { span: parent } } msg = "p2");
+
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(parent_record).unwrap();
+    let sr = entry.span_range().unwrap();
+    // Flag remains set: parent has data in a previous bucket.
+    assert!(sr.from_previous_bucket());
+    // Mask was claimed atomically and now points at this record.
+    let first = sr.first_mask.load(Ordering::Acquire);
+    let last = sr.last_mask.load(Ordering::Acquire);
+    assert_ne!(first, super::SPAN_MASK_NONE);
+    assert_ne!(last, super::SPAN_MASK_NONE);
+}
+
+#[test]
+fn fresh_span_has_no_previous_bucket_flag() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let s = span_id_for(0xE0);
+    let weak = log!(writer; { span: SpanInfo::Start { span: s, parent: None } } msg = "s");
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let entry = bucket.upgrade(weak).unwrap();
+    assert!(!entry.span_range().unwrap().from_previous_bucket());
+}
+
+#[test]
+fn span_table_drops_entries_for_rotated_out_bucket() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let span = span_id_for(0xC0);
+    log!(writer; { span: SpanInfo::Start { span, parent: None } } msg = "x");
+    assert!(writer.index.span_table.contains_key(&span));
+    // BUCKET_COUNT rotations should evict the bucket originally holding the span.
+    for _ in 0..super::BUCKET_COUNT {
+        writer.index.complete_bucket();
+    }
+    assert!(!writer.index.span_table.contains_key(&span));
+}
+
 #[test]
 fn oversized_interned_ranges_are_rejected() {
     let mut index = test_index();

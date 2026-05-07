@@ -193,12 +193,33 @@ pub fn record(
     }
     enc.new_uuids_cursor = new_uuids.len();
 
-    // Emit SpanDecl if span_table grew (a new span this record).
-    let span_idx = unsafe { bucket.span_index_at(log_index) };
-    if span_count > enc.declared_span_count as usize && span_idx != u32::MAX && span_idx >= enc.declared_span_count {
-        let sr = unsafe { bucket.span_range_at(span_idx) };
-        emit_span_decl(buf, span_idx, sr.id.as_u64(), sr.parent.map(|p| p.as_u64()));
-        enc.declared_span_count = span_count as u32;
+    // Emit SpanDecls for every slot newly allocated in span_data since the
+    // last record. A single record can allocate more than one slot: the
+    // record's own span at the lowest new slot, then any cross-bucket
+    // parents replicated above it.
+    //
+    // INVARIANT (relied on for replay parent_index resolution):
+    //
+    //   The slot range [declared_span_count, span_count) for a single
+    //   `record()` call always forms a single ancestor chain ordered
+    //   child-at-low-slot, root-at-high-slot. This holds because
+    //   `Index::install_live_span` allocates the leaf first, then iterates
+    //   up the parent chain with each step appending to `spans_used` — and
+    //   `record()` is called exactly once per log entry.
+    //
+    // We emit this batch in REVERSE slot order so replay's
+    // `install_span_decl` sees parents before children within the batch.
+    // Combined with the fact that any parent from an earlier batch is
+    // already in `span_table` from its own prior emission, this lets
+    // replay resolve `parent_index` inline without a post-pass fixup.
+    let new_start = enc.declared_span_count;
+    let new_end = span_count as u32;
+    if new_end > new_start {
+        for slot in (new_start..new_end).rev() {
+            let sr = unsafe { bucket.span_range_at(slot) };
+            emit_span_decl(buf, slot, sr.id.as_u64(), sr.parent.map(|p| p.as_u64()), sr.flags);
+        }
+        enc.declared_span_count = new_end;
     }
 
     // Emit ArchetypeDecl if archetype_map grew.
@@ -308,7 +329,7 @@ fn emit_uuid_decl(buf: &mut Vec<u8>, uuid_offset: u32, bytes: &[u8; 16]) {
     finish_frame(buf, pos);
 }
 
-fn emit_span_decl(buf: &mut Vec<u8>, span_id: u32, span_full: u64, parent: Option<u64>) {
+fn emit_span_decl(buf: &mut Vec<u8>, span_id: u32, span_full: u64, parent: Option<u64>, flags: u32) {
     let pos = begin_frame(buf, FrameTag::SpanDecl);
     write_uvarint(buf, span_id as u64);
     buf.extend_from_slice(&span_full.to_le_bytes());
@@ -321,6 +342,7 @@ fn emit_span_decl(buf: &mut Vec<u8>, span_id: u32, span_full: u64, parent: Optio
             buf.push(0);
         }
     }
+    write_uvarint(buf, flags as u64);
     finish_frame(buf, pos);
 }
 
