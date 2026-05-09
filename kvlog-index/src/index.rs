@@ -23,7 +23,7 @@ use std::{
     os::raw::c_void,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -394,8 +394,17 @@ pub struct SpanRange {
     /// point at this slot, so readers that observe the new
     /// `first_child_index` always see a consistent `next_sibling_index`.
     pub next_sibling_index: AtomicU32,
+    /// Timestamp (UTC ns) of the *first* record observed for this span
+    /// across the live bucket ring. Set on the Start record and
+    /// preserved across cross-bucket replication so a span ending in a
+    /// later bucket can still resolve its full duration. The
+    /// [`SPAN_TS_UNSET`] sentinel means "no record observed yet" — used
+    /// for cross-bucket parent stubs whose Start lived in an evicted
+    /// bucket.
+    pub start_ts_ns: AtomicU64,
 }
-const _: () = assert!(std::mem::size_of::<SpanRange>() == 40);
+pub const SPAN_TS_UNSET: u64 = u64::MAX;
+const _: () = assert!(std::mem::size_of::<SpanRange>() == 48);
 impl SpanRange {
     fn index_range(&self) -> std::ops::Range<u32> {
         let first = self.first_mask.load(Ordering::Acquire);
@@ -704,13 +713,28 @@ impl<'a> LogEntry<'a> {
         span_index
     }
     pub fn span_ns_duration(&self) -> Option<u64> {
-        let span_index = unsafe { *self.bucket.span_index.as_ptr().add(self.index as usize) };
-        let range = self.span_range()?.true_index_range();
-        unsafe {
-            let start = self.bucket.timestamp.add(range.start as usize).read();
-            let end = self.bucket.timestamp.add(range.end as usize).read();
-            Some(end.abs_diff(start))
-        }
+        let span_range = self.span_range()?;
+        let range = span_range.true_index_range();
+        // Resolve the end timestamp from the span's last record in this
+        // bucket. When the span's first record landed in this bucket too,
+        // `range.start` is the Start; otherwise we use the persistent
+        // `start_ts_ns` set by the original Start.
+        let end_ts = if range.is_empty() {
+            // Span has no records in this bucket (a stub). Fall back to
+            // this entry's own timestamp.
+            self.timestamp()
+        } else {
+            unsafe { self.bucket.timestamp.add(range.end as usize).read() }
+        };
+        let stored_start = span_range.start_ts_ns.load(Ordering::Acquire);
+        let start_ts = if stored_start != SPAN_TS_UNSET {
+            stored_start
+        } else if !range.is_empty() {
+            unsafe { self.bucket.timestamp.add(range.start as usize).read() }
+        } else {
+            return None;
+        };
+        Some(end_ts.abs_diff(start_ts))
     }
     pub fn span_range(&self) -> Option<&SpanRange> {
         let span_index = unsafe { *self.bucket.span_index.as_ptr().add(self.index as usize) };
@@ -1403,6 +1427,7 @@ fn allocate_span_slot(
     first_mask: u32,
     last_mask: u32,
     flags: u32,
+    start_ts_ns: u64,
 ) -> Option<u32> {
     if *spans_used >= BUCKET_SPAN_RANGE_SIZE {
         return None;
@@ -1419,6 +1444,7 @@ fn allocate_span_slot(
             flags,
             first_child_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
             next_sibling_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
+            start_ts_ns: AtomicU64::new(start_ts_ns),
         });
     }
     Some(slot)
@@ -1926,6 +1952,7 @@ impl Index {
         span_info: &SpanInfo,
         start_mask: u32,
         end_mask: u32,
+        timestamp: u64,
     ) -> Result<Option<u32>, MunchError> {
         use hashbrown::hash_map::Entry;
         let cur_gen = self.generation as u32;
@@ -1970,6 +1997,15 @@ impl Index {
                         );
                     }
                     sr.last_mask.store(logs_used | end_mask, Ordering::Release);
+                    // Claim start_ts_ns for the very first record observed
+                    // on this span (whether Start, Current or End): the
+                    // sentinel-to-real CAS preserves the earliest write.
+                    let _ = sr.start_ts_ns.compare_exchange(
+                        SPAN_TS_UNSET,
+                        timestamp,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    );
                     return Ok(Some(loc.index));
                 }
                 // Cross-bucket: SpanInfo::Start carries the parent explicitly,
@@ -1987,11 +2023,30 @@ impl Index {
                 };
                 // Cross-bucket: this span has records in a previous bucket,
                 // so set SPAN_FLAG_FROM_PREVIOUS_BUCKET. The flag is
-                // permanent across this bucket's lifetime.
+                // permanent across this bucket's lifetime. Inherit the
+                // previously-recorded start timestamp so percentile/duration
+                // computations on the End record can still resolve.
+                let inherited_start_ts = {
+                    let old_bucket = &buckets[(loc.generation & 0b11) as usize];
+                    if old_bucket.generation.load(Ordering::Acquire) == loc.generation {
+                        let prev = unsafe { &*old_bucket.span_data.as_ptr().add(loc.index as usize) };
+                        prev.start_ts_ns.load(Ordering::Acquire)
+                    } else {
+                        SPAN_TS_UNSET
+                    }
+                };
+                let initial_start_ts = if inherited_start_ts != SPAN_TS_UNSET {
+                    inherited_start_ts
+                } else {
+                    // Fallback: this is the first record we have for the
+                    // span, so its timestamp is the best start we have.
+                    timestamp
+                };
                 let Some(slot) = allocate_span_slot(
                     spans_used, bucket, span, actual_parent,
                     logs_used | start_mask, logs_used | end_mask,
                     SPAN_FLAG_FROM_PREVIOUS_BUCKET,
+                    initial_start_ts,
                 ) else {
                     return Ok(None);
                 };
@@ -2001,10 +2056,12 @@ impl Index {
             Entry::Vacant(entry) => {
                 // Brand-new span: no prior-bucket data, flags = 0. Queries
                 // bounded to this span do not need to search older buckets.
+                // The first record's timestamp is the span's start time.
                 let actual_parent = if let SpanInfo::Start { .. } = span_info { span_parent } else { None };
                 let Some(slot) = allocate_span_slot(
                     spans_used, bucket, span, actual_parent,
                     logs_used | start_mask, logs_used | end_mask, 0,
+                    timestamp,
                 ) else {
                     return Ok(None);
                 };
@@ -2033,6 +2090,7 @@ impl Index {
                         spans_used, bucket, parent_id, None,
                         SPAN_MASK_NONE, SPAN_MASK_NONE,
                         SPAN_FLAG_FROM_PREVIOUS_BUCKET,
+                        SPAN_TS_UNSET,
                     ) else {
                         break;
                     };
@@ -2058,13 +2116,18 @@ impl Index {
                     if old_bucket.generation.load(Ordering::Acquire) != loc.generation {
                         break;
                     }
-                    let grandparent = unsafe { (*old_bucket.span_data.as_ptr().add(loc.index as usize)).parent };
+                    let prev_sr = unsafe { &*old_bucket.span_data.as_ptr().add(loc.index as usize) };
+                    let grandparent = prev_sr.parent;
+                    let inherited_start_ts = prev_sr.start_ts_ns.load(Ordering::Acquire);
                     // Replicated stub: masks are SPAN_MASK_NONE until a
                     // record for this span lands in the current bucket.
+                    // Inherit the start timestamp from the source so
+                    // span_ns_duration can resolve cross-bucket spans.
                     let Some(slot) = allocate_span_slot(
                         spans_used, bucket, parent_id, grandparent,
                         SPAN_MASK_NONE, SPAN_MASK_NONE,
                         SPAN_FLAG_FROM_PREVIOUS_BUCKET,
+                        inherited_start_ts,
                     ) else {
                         break;
                     };
@@ -2109,8 +2172,8 @@ impl Index {
             None => SPAN_PARENT_INDEX_NONE,
         };
         let bucket = &self.reader.buckets[self.generation & 0b11];
-        // Initialize first_mask/last_mask to the SPAN_MASK_NONE sentinel.
-        // The Record frame will claim them via atomic stores in install_record.
+        // Initialize first_mask/last_mask/start_ts_ns to sentinels. The
+        // Record frame will claim them via atomic stores in install_record.
         unsafe {
             bucket.span_data.as_ptr().add(span_id as usize).write(SpanRange {
                 id: span,
@@ -2121,6 +2184,7 @@ impl Index {
                 flags,
                 first_child_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
                 next_sibling_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
+                start_ts_ns: AtomicU64::new(SPAN_TS_UNSET),
             });
         }
         if (span_id as usize) >= self.spans_used {
@@ -2263,6 +2327,15 @@ impl Index {
                         sr.last_mask.store(raw_index | (1u32 << 31), Ordering::Release);
                     }
                 }
+                // First record observed for this span (in any kind) sets
+                // start_ts_ns. Cross-bucket replicated stubs may already
+                // hold a real value; preserve it.
+                let _ = sr.start_ts_ns.compare_exchange(
+                    SPAN_TS_UNSET,
+                    timestamp,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
                 unsafe {
                     bucket.span_index.as_ptr().add(log_index).write(sid);
                 }
@@ -2570,7 +2643,7 @@ impl Index {
             SpanInfo::None => None,
         };
         let span_index = match span {
-            Some(span) => match self.install_live_span(span, span_parent, &span_info, start_mask, end_mask)? {
+            Some(span) => match self.install_live_span(span, span_parent, &span_info, start_mask, end_mask, timestamp)? {
                 Some(idx) => idx,
                 None => return Ok(false),
             },

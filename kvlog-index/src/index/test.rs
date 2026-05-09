@@ -511,6 +511,55 @@ fn cross_bucket_stub_keeps_flag_after_record_lands() {
 }
 
 #[test]
+fn span_ns_duration_resolves_within_bucket() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let span = span_id_for(0xF0);
+
+    // Two records on the same span in the same bucket. The first record
+    // is the Start at writer.time (=1), the second is the End at
+    // writer.time+1 (=2). Duration should be 1ns.
+    let start_weak = log!(writer; { span: SpanInfo::Start { span, parent: None } } msg = "s");
+    let end_weak = log!(writer; { span: SpanInfo::End { span } } msg = "e");
+
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let start_entry = bucket.upgrade(start_weak).unwrap();
+    let end_entry = bucket.upgrade(end_weak).unwrap();
+    assert_eq!(start_entry.span_ns_duration(), Some(1));
+    assert_eq!(end_entry.span_ns_duration(), Some(1));
+}
+
+#[test]
+fn span_ns_duration_resolves_across_bucket_rotation() {
+    // Span starts in bucket N, ends in bucket N+1. The Start record's
+    // timestamp is preserved in `start_ts_ns` so the End record's
+    // span_ns_duration still resolves correctly. This is the cross-bucket
+    // robustness fix from the analysis subsystem plan.
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let span = span_id_for(0xF1);
+
+    // Start at t=1.
+    let _ = log!(writer; { span: SpanInfo::Start { span, parent: None } } msg = "start");
+    writer.index.complete_bucket();
+
+    // Force the writer's time to advance past the rotation so the End
+    // timestamp is meaningfully later.
+    writer.time = 100;
+    let end_weak = log!(writer; { span: SpanInfo::End { span } } msg = "end");
+
+    let reader = writer.index.reader().clone();
+    let bucket = reader.newest_bucket().unwrap();
+    let end_entry = bucket.upgrade(end_weak).unwrap();
+    let dur = end_entry.span_ns_duration().expect("duration must resolve");
+    // End at 100, Start at 1 → 99ns.
+    assert_eq!(dur, 99);
+    // The cross-bucket flag is set on the replicated SpanRange.
+    assert!(end_entry.span_range().unwrap().from_previous_bucket());
+}
+
+#[test]
 fn fresh_span_has_no_previous_bucket_flag() {
     let mut index = test_index();
     let mut writer = TestIndexWriter::new(&mut index);
