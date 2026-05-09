@@ -149,6 +149,7 @@ fn compile_pred<'b>(
         Pred::HasParentSpan(_) => return Err(VmCompileError::UnsupportedPredicate(PredKind::HasParentSpan)),
         Pred::SpanIs(_, _) => return Err(VmCompileError::UnsupportedPredicate(PredKind::SpanIs)),
         Pred::ParentSpanIs(_, _) => return Err(VmCompileError::UnsupportedPredicate(PredKind::ParentSpanIs)),
+        Pred::SpanInSet(_, _) => return Err(VmCompileError::UnsupportedPredicate(PredKind::SpanInSet)),
         Pred::HasSpan(negated) => {
             if *negated {
                 std::mem::swap(&mut fail, &mut succ);

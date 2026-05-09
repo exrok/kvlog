@@ -34,6 +34,7 @@ use crate::persistence::encoder::{self as stream_encoder, BucketLogStreamEncoder
 use crate::persistence::{DrainedLogBuffer, IndexConfig};
 pub mod archetype;
 pub use archetype::Archetype;
+pub mod span_graph;
 
 #[cfg(test)]
 pub(crate) mod test;
@@ -330,6 +331,13 @@ pub const SPAN_PARENT_INDEX_NONE: u32 = u32::MAX;
 /// 0, and that case must remain distinguishable.
 pub const SPAN_MASK_NONE: u32 = u32::MAX;
 
+/// Sentinel value for `SpanRange::first_child_index` and
+/// `SpanRange::next_sibling_index` meaning "no further span in the list".
+/// Children are stored as a singly-linked intrusive list keyed by
+/// bucket-local span slots: a span's `first_child_index` is the head, and
+/// each child's `next_sibling_index` is the next link.
+pub const SPAN_CHILD_INDEX_NONE: u32 = u32::MAX;
+
 /// Set on `SpanRange::flags` when the span has data in a previous bucket as
 /// well — either because it was replicated into this bucket as a
 /// cross-bucket parent stub, or because records for it span across bucket
@@ -347,11 +355,12 @@ pub const MAX_CROSS_BUCKET_PARENT_DEPTH: usize = 8;
 
 /// Per-span metadata in a bucket.
 ///
-/// Initialization is one-shot: every non-atomic field (`id`, `parent`,
-/// `parent_index`, `flags`) is written exactly once at allocation and never
-/// modified afterwards. `first_mask` and `last_mask` are atomic and may be
-/// updated by the ingest thread after publication. Concurrent readers thus
-/// observe stable non-atomic data and atomically-updated mask data.
+/// Initialization is one-shot for the non-atomic fields: `id`, `parent`,
+/// `parent_index`, `flags` are written exactly once at allocation and never
+/// modified afterwards. `first_mask`, `last_mask`, `first_child_index`,
+/// `next_sibling_index` are atomic and may be updated by the ingest thread
+/// after publication. Concurrent readers thus observe stable non-atomic
+/// data and atomically-updated mask and child-list data.
 #[derive(Debug)]
 #[repr(C)]
 pub struct SpanRange {
@@ -372,8 +381,21 @@ pub struct SpanRange {
     /// Bitfield of `SPAN_FLAG_*` constants. Set at allocation time and
     /// never mutated afterwards.
     pub flags: u32,
+    /// Head of this span's child list. [`SPAN_CHILD_INDEX_NONE`] when no
+    /// child has been observed in this bucket. Children are spliced in
+    /// front (newest first); readers walking via `next_sibling_index` see
+    /// children in reverse-insertion order. Atomically mutated after
+    /// publication because new children may arrive in batches after the
+    /// parent's slot has already been published.
+    pub first_child_index: AtomicU32,
+    /// Next sibling under the same parent. [`SPAN_CHILD_INDEX_NONE`] when
+    /// this span is the last in the parent's list. Written exactly once at
+    /// splice time, before the parent's `first_child_index` is updated to
+    /// point at this slot, so readers that observe the new
+    /// `first_child_index` always see a consistent `next_sibling_index`.
+    pub next_sibling_index: AtomicU32,
 }
-const _: () = assert!(std::mem::size_of::<SpanRange>() == 32);
+const _: () = assert!(std::mem::size_of::<SpanRange>() == 40);
 impl SpanRange {
     fn index_range(&self) -> std::ops::Range<u32> {
         let first = self.first_mask.load(Ordering::Acquire);
@@ -1368,9 +1390,11 @@ impl IndexReader {
 /// to it. Returns the slot index, or `None` when the bucket has no
 /// SpanRange capacity left. `parent_index` starts at
 /// [`SPAN_PARENT_INDEX_NONE`]; the caller patches it once the parent's
-/// slot is known. Free function (rather than a method) so callers can split
-/// borrows: this only mutates `spans_used` and writes to `bucket.span_data`,
-/// leaving `Index::span_table` available for entry-API mutation.
+/// slot is known and then calls [`splice_child_into_parent`] to link the
+/// new slot into its parent's child list. Free function (rather than a
+/// method) so callers can split borrows: this only mutates `spans_used`
+/// and writes to `bucket.span_data`, leaving `Index::span_table` available
+/// for entry-API mutation.
 fn allocate_span_slot(
     spans_used: &mut usize,
     bucket: &Bucket,
@@ -1393,9 +1417,38 @@ fn allocate_span_slot(
             first_mask: AtomicU32::new(first_mask),
             last_mask: AtomicU32::new(last_mask),
             flags,
+            first_child_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
+            next_sibling_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
         });
     }
     Some(slot)
+}
+
+/// Splice `child_slot` into `parent_slot`'s child list. Single-writer:
+/// only the ingest thread mutates `span_data`. Readers walk children via
+/// `parent.first_child_index` (Acquire) followed by `next_sibling_index`
+/// (Acquire). They must bound-check each visited slot against their
+/// `BucketGuard::span_count` snapshot since the splice may install a
+/// `child_slot` whose contents are not yet committed for that snapshot.
+///
+/// The `next_sibling_index` write is Relaxed because the publishing
+/// happens-before is provided by the `Release` store on
+/// `parent.first_child_index` — a reader that Acquire-loads the new head
+/// also sees this thread's prior `next_sibling_index` write.
+fn splice_child_into_parent(bucket: &Bucket, child_slot: u32, parent_slot: u32) {
+    if parent_slot == SPAN_PARENT_INDEX_NONE {
+        return;
+    }
+    unsafe {
+        let parent_sr = &*bucket.span_data.as_ptr().add(parent_slot as usize);
+        let child_sr = &*bucket.span_data.as_ptr().add(child_slot as usize);
+        // Single writer: Relaxed load on the head suffices. The Release
+        // store on parent's head below makes the next_sibling_index store
+        // visible to any Acquire-loading reader.
+        let head = parent_sr.first_child_index.load(Ordering::Relaxed);
+        child_sr.next_sibling_index.store(head, Ordering::Relaxed);
+        parent_sr.first_child_index.store(child_slot, Ordering::Release);
+    }
 }
 
 unsafe fn mmap_alloc<T: Sized>(amount: usize) -> NonNull<T> {
@@ -1988,6 +2041,7 @@ impl Index {
                         let child_sr = bucket.span_data.as_ptr().add(child_slot as usize) as *mut SpanRange;
                         (*child_sr).parent_index = slot;
                     }
+                    splice_child_into_parent(bucket, child_slot, slot);
                     break;
                 }
                 Entry::Occupied(mut entry) => {
@@ -1997,6 +2051,7 @@ impl Index {
                             let child_sr = bucket.span_data.as_ptr().add(child_slot as usize) as *mut SpanRange;
                             (*child_sr).parent_index = loc.index;
                         }
+                        splice_child_into_parent(bucket, child_slot, loc.index);
                         break;
                     }
                     let old_bucket = &buckets[(loc.generation & 0b11) as usize];
@@ -2018,6 +2073,7 @@ impl Index {
                         let child_sr = bucket.span_data.as_ptr().add(child_slot as usize) as *mut SpanRange;
                         (*child_sr).parent_index = slot;
                     }
+                    splice_child_into_parent(bucket, child_slot, slot);
                     child_slot = slot;
                     next_parent = grandparent;
                 }
@@ -2063,12 +2119,15 @@ impl Index {
                 first_mask: AtomicU32::new(SPAN_MASK_NONE),
                 last_mask: AtomicU32::new(SPAN_MASK_NONE),
                 flags,
+                first_child_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
+                next_sibling_index: AtomicU32::new(SPAN_CHILD_INDEX_NONE),
             });
         }
         if (span_id as usize) >= self.spans_used {
             self.spans_used = (span_id as usize) + 1;
         }
         self.span_table.insert(span, SpanRangeIndex { generation: cur_gen, index: span_id });
+        splice_child_into_parent(bucket, span_id, parent_index);
         Ok(())
     }
 

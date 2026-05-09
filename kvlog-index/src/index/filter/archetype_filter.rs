@@ -251,6 +251,7 @@ impl<'a> ArchetypePrefilter<'a> {
                 overall
             }
             Pred::SpanIs(negated, _)
+            | Pred::SpanInSet(negated, _)
             | Pred::ParentSpanIs(negated, _)
             | Pred::HasParentSpan(negated)
             | Pred::SpanDurationRange { negated, .. } => {

@@ -86,6 +86,19 @@ impl QueryExpr {
         // This is tested by miri.
         Ok(QueryExpr { pred: unsafe { std::mem::transmute::<PredBuilder, PredBuilder<'static>>(pred) }, bump })
     }
+
+    /// Build a [`QueryExpr`] whose only filter is `span_id ∈ set`. Used by
+    /// the connected-component "context" query: the server computes the
+    /// component as a `Vec<u64>`, sorts it, and passes it here. The slice
+    /// is copied into this `QueryExpr`'s bumpalo so it owns its data.
+    pub fn from_sorted_span_set(set: &[u64]) -> QueryExpr {
+        let bump = bumpalo::Bump::new();
+        let slice: &[u64] = bump.alloc_slice_copy(set);
+        let pred = PredBuilder::SpanInSet(false, slice);
+        // Safety: same as `new` — the bump arena owns the slice and is
+        // dropped together with this struct.
+        QueryExpr { pred: unsafe { std::mem::transmute::<PredBuilder, PredBuilder<'static>>(pred) }, bump }
+    }
 }
 
 struct Muncher<'a> {

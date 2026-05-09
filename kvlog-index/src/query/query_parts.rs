@@ -446,6 +446,10 @@ pub enum Pred<'b> {
     Or(&'b [Pred<'b>]),
     SpanIs(bool, u64),
     ParentSpanIs(bool, u64),
+    /// `span_id` is a member of the given sorted, distinct set of raw
+    /// SpanID `u64` values. Used by the connected-span context query;
+    /// constructed programmatically (no surface-syntax parser).
+    SpanInSet(bool, &'b [u64]),
     HasSpan(bool),
     HasParentSpan(bool),
     SpanDurationRange { negated: bool, min_ns: u64, max_ns: u64 },
@@ -527,6 +531,14 @@ impl<'b> Pred<'b> {
             Pred::ParentSpanIs(negated, span) => {
                 if let Some(field_parent_span) = log.parent_span_id() {
                     if field_parent_span.as_u64() == *span {
+                        return !negated;
+                    }
+                }
+                return *negated;
+            }
+            Pred::SpanInSet(negated, set) => {
+                if let Some(field_span) = log.span_id() {
+                    if set.binary_search(&field_span.as_u64()).is_ok() {
                         return !negated;
                     }
                 }
@@ -732,6 +744,10 @@ pub enum PredBuilder<'b> {
     Or(Bumpy<'b, PredBuilder<'b>>),
     SpanIs(bool, u64),
     ParentSpanIs(bool, u64),
+    /// Sorted, distinct slice of raw SpanID `u64` values; backed by the
+    /// builder's bumpalo arena. Constructed programmatically by the
+    /// connected-span context query.
+    SpanInSet(bool, &'b [u64]),
     HasSpan(bool),
     HasParentSpan(bool),
     SpanDurationRange { negated: bool, min_ns: u64, max_ns: u64 },
@@ -762,6 +778,7 @@ impl<'b> std::fmt::Debug for PredBuilder<'b> {
             }
             Self::SpanIs(arg0, arg1) => f.debug_tuple("SpanIs").field(arg0).field(arg1).finish(),
             Self::ParentSpanIs(arg0, arg1) => f.debug_tuple("ParentSpanIs").field(arg0).field(arg1).finish(),
+            Self::SpanInSet(negated, set) => f.debug_tuple("SpanInSet").field(negated).field(&set.len()).finish(),
             Self::HasSpan(arg0) => f.debug_tuple("HasSpan").field(arg0).finish(),
             Self::HasParentSpan(arg0) => f.debug_tuple("HasParentSpan").field(arg0).finish(),
             Self::SpanDurationRange { negated, min_ns, max_ns } => f
@@ -1064,6 +1081,14 @@ impl<'b> PredBuilder<'b> {
                 }
                 return *negated;
             }
+            PredBuilder::SpanInSet(negated, set) => {
+                if let Some(field_span) = log.span_id() {
+                    if set.binary_search(&field_span.as_u64()).is_ok() {
+                        return !negated;
+                    }
+                }
+                return *negated;
+            }
             PredBuilder::HasSpan(negated) => {
                 if log.span_range().is_some() {
                     return !*negated;
@@ -1262,6 +1287,9 @@ impl<'b> PredBuilder<'b> {
             }
             PredBuilder::SpanIs(negated, span_id) => R::Ok(Pred::SpanIs(*negated, *span_id)),
             PredBuilder::ParentSpanIs(negated, span_id) => R::Ok(Pred::ParentSpanIs(*negated, *span_id)),
+            PredBuilder::SpanInSet(negated, set) => {
+                R::Ok(Pred::SpanInSet(*negated, bump.alloc_slice_copy(set)))
+            }
             PredBuilder::HasSpan(negated) => R::Ok(Pred::HasSpan(*negated)),
             PredBuilder::HasParentSpan(negated) => R::Ok(Pred::HasParentSpan(*negated)),
             PredBuilder::SpanDurationRange { negated, min_ns, max_ns: mas_ns } => {
@@ -1366,6 +1394,9 @@ impl<'b> PredBuilder<'b> {
             }
             PredBuilder::SpanIs(negated, span_id) => R::Ok(Pred::SpanIs(*negated, *span_id)),
             PredBuilder::ParentSpanIs(negated, span_id) => R::Ok(Pred::ParentSpanIs(*negated, *span_id)),
+            PredBuilder::SpanInSet(negated, set) => {
+                R::Ok(Pred::SpanInSet(*negated, bump.alloc_slice_copy(set)))
+            }
             PredBuilder::HasSpan(negated) => R::Ok(Pred::HasSpan(*negated)),
             PredBuilder::HasParentSpan(negated) => R::Ok(Pred::HasParentSpan(*negated)),
             PredBuilder::SpanDurationRange { negated, min_ns, max_ns: mas_ns } => {
@@ -1423,6 +1454,7 @@ impl<'b> PredBuilder<'b> {
                 field.negate();
             }
             PredBuilder::SpanIs(negated, _)
+            | PredBuilder::SpanInSet(negated, _)
             | PredBuilder::ParentSpanIs(negated, _)
             | PredBuilder::HasSpan(negated)
             | PredBuilder::HasParentSpan(negated)

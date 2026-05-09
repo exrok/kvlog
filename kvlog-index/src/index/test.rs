@@ -667,3 +667,216 @@ fn oversized_message_does_not_rotate_bucket() {
     assert!(matches!(result, Err(MunchError::InvalidValue)));
     assert_eq!(index.generation(), 0);
 }
+
+// ----- Span graph (connected component) tests -----
+
+#[test]
+fn span_component_within_single_bucket() {
+    // Tree:  root -> mid -> leaf
+    //              \-> sib (sibling of mid? no — sibling of leaf, child of mid)
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0xC0);
+    let mid = span_id_for(0xC1);
+    let leaf = span_id_for(0xC2);
+    let sib = span_id_for(0xC3);
+
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "root");
+    log!(writer; { span: SpanInfo::Start { span: mid, parent: Some(root) } } msg = "mid");
+    log!(writer; { span: SpanInfo::Start { span: leaf, parent: Some(mid) } } msg = "leaf");
+    log!(writer; { span: SpanInfo::Start { span: sib, parent: Some(mid) } } msg = "sibling-of-leaf");
+
+    let reader = writer.index.reader().clone();
+    let guard = reader.generation_guard();
+    let component = guard.span_component(leaf).expect("leaf must be observable");
+    let expected: hashbrown::HashSet<_> = [root, mid, leaf, sib].into_iter().collect();
+    assert_eq!(*component, expected);
+}
+
+#[test]
+fn span_component_returns_none_for_unknown_span() {
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0xD0);
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "root");
+
+    let reader = writer.index.reader().clone();
+    let guard = reader.generation_guard();
+    assert!(guard.span_component(span_id_for(0xDEAD)).is_none());
+}
+
+#[test]
+fn span_component_unions_across_bucket_rotation() {
+    // Bucket 0 has root -> mid; bucket 1 has mid -> leaf (mid is replicated
+    // as a cross-bucket parent stub). The connected component of leaf must
+    // include root, mid, and leaf even though leaf was never observed in
+    // bucket 0.
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0xE0);
+    let mid = span_id_for(0xE1);
+    let leaf = span_id_for(0xE2);
+
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "root");
+    log!(writer; { span: SpanInfo::Start { span: mid, parent: Some(root) } } msg = "mid");
+    writer.index.complete_bucket();
+    log!(writer; { span: SpanInfo::Start { span: leaf, parent: Some(mid) } } msg = "leaf");
+
+    let reader = writer.index.reader().clone();
+    let guard = reader.generation_guard();
+    let component = guard.span_component(leaf).expect("leaf must be observable");
+    let expected: hashbrown::HashSet<_> = [root, mid, leaf].into_iter().collect();
+    assert_eq!(*component, expected);
+}
+
+#[test]
+fn span_component_includes_siblings_in_other_bucket() {
+    // Children are NOT replicated across buckets: a sibling allocated in
+    // an older bucket is reachable only via that bucket's child list.
+    // Bucket 0: root -> {child_a, child_b}
+    // Bucket 1: root reappears with a new child child_c
+    // Component of child_c should include root, child_a, child_b, child_c.
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0xF0);
+    let child_a = span_id_for(0xF1);
+    let child_b = span_id_for(0xF2);
+    let child_c = span_id_for(0xF3);
+
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "root");
+    log!(writer; { span: SpanInfo::Start { span: child_a, parent: Some(root) } } msg = "a");
+    log!(writer; { span: SpanInfo::Start { span: child_b, parent: Some(root) } } msg = "b");
+    writer.index.complete_bucket();
+    log!(writer; { span: SpanInfo::Start { span: child_c, parent: Some(root) } } msg = "c");
+
+    let reader = writer.index.reader().clone();
+    let guard = reader.generation_guard();
+    let component = guard.span_component(child_c).expect("child_c must be observable");
+    let expected: hashbrown::HashSet<_> = [root, child_a, child_b, child_c].into_iter().collect();
+    assert_eq!(*component, expected);
+}
+
+#[test]
+fn span_in_set_predicate_via_query_walker() {
+    // End-to-end: build a connected component, build a QueryExpr from
+    // it via `from_sorted_span_set`, run a forward query through the
+    // public IndexReader API, and assert the right entries come out.
+    use crate::index::filter::Query;
+    use crate::query::QueryExpr;
+
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0x200);
+    let child = span_id_for(0x201);
+    let unrelated = span_id_for(0x202);
+
+    let _l1 = log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "in-root");
+    let _l2 = log!(writer; { span: SpanInfo::Current { span: root } } msg = "in-root-2");
+    let _l3 = log!(writer; { span: SpanInfo::Start { span: child, parent: Some(root) } } msg = "in-child");
+    let _l4 = log!(writer; { span: SpanInfo::Start { span: unrelated, parent: None } } msg = "in-unrelated");
+    let _l5 = log!(writer; msg = "no-span");
+
+    let reader = writer.index.reader().clone();
+    let guard = reader.generation_guard();
+    let component = guard.span_component(child).expect("child must be observable");
+    let mut sorted: Vec<u64> = component.iter().map(kvlog::SpanID::as_u64).collect();
+    sorted.sort_unstable();
+    drop(guard);
+
+    let mut qb = Query::builder();
+    qb.with_parsed_expr(QueryExpr::from_sorted_span_set(&sorted));
+    let query = qb.build();
+
+    let mut messages: Vec<String> = Vec::new();
+    let mut walker = reader.forward_query(&query.filters);
+    while let Some(entries) = walker.next() {
+        for entry in &entries {
+            messages.push(String::from_utf8_lossy(entry.message()).into_owned());
+        }
+    }
+    walker.release_bucket_reclamation_lock();
+
+    messages.sort();
+    assert_eq!(messages, vec!["in-child", "in-root", "in-root-2"]);
+}
+
+#[test]
+fn span_in_set_predicate_via_bidirectional_walker() {
+    // Same shape as the forward test, but exercises the bidirectional
+    // walker since that's what the server's `query()` body uses for
+    // non-`from_oldest` queries (including the context pane).
+    use crate::index::filter::Query;
+    use crate::query::QueryExpr;
+
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0x300);
+    let child = span_id_for(0x301);
+    let unrelated = span_id_for(0x302);
+
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "bd-root");
+    log!(writer; { span: SpanInfo::Start { span: child, parent: Some(root) } } msg = "bd-child");
+    log!(writer; { span: SpanInfo::Start { span: unrelated, parent: None } } msg = "bd-unrelated");
+    log!(writer; msg = "bd-no-span");
+
+    let reader = writer.index.reader().clone();
+    let guard = reader.generation_guard();
+    let component = guard.span_component(child).expect("child must be observable");
+    let mut sorted: Vec<u64> = component.iter().map(kvlog::SpanID::as_u64).collect();
+    sorted.sort_unstable();
+    drop(guard);
+
+    let mut qb = Query::builder();
+    qb.with_parsed_expr(QueryExpr::from_sorted_span_set(&sorted));
+    let query = qb.build();
+
+    let (mut reverse, _forward) = reader.bidirectional_query(&query.filters);
+    let mut messages: Vec<String> = Vec::new();
+    while let Some(entries) = reverse.next() {
+        for entry in &entries {
+            messages.push(String::from_utf8_lossy(entry.message()).into_owned());
+        }
+    }
+    reverse.release_bucket_reclamation_lock();
+
+    messages.sort();
+    assert_eq!(messages, vec!["bd-child", "bd-root"]);
+}
+
+#[test]
+fn span_component_extend_from_new_spans() {
+    // Live mode delta sweep: start with a component containing just root,
+    // append a child, run extend, assert child is added.
+    let mut index = test_index();
+    let mut writer = TestIndexWriter::new(&mut index);
+    let root = span_id_for(0x110);
+    let child = span_id_for(0x111);
+    let unrelated = span_id_for(0x112);
+
+    log!(writer; { span: SpanInfo::Start { span: root, parent: None } } msg = "root");
+
+    let reader = writer.index.reader().clone();
+    let guard_before = reader.generation_guard();
+    let bucket_before = guard_before.buckets().next().unwrap();
+    let span_count_before = bucket_before.spans().len() as u32;
+    drop(guard_before);
+
+    log!(writer; { span: SpanInfo::Start { span: child, parent: Some(root) } } msg = "child");
+    log!(writer; { span: SpanInfo::Start { span: unrelated, parent: None } } msg = "unrelated");
+
+    let reader = writer.index.reader().clone();
+    let guard = reader.generation_guard();
+    let bucket_after = guard.buckets().next().unwrap();
+    let span_count_after = bucket_after.spans().len() as u32;
+
+    let mut component: hashbrown::HashSet<_> = [root].into_iter().collect();
+    let changed = guard.extend_component_from_new_spans(
+        &mut component,
+        bucket_after,
+        span_count_before..span_count_after,
+    );
+
+    assert!(changed, "child spliced under root should extend the component");
+    assert!(component.contains(&child), "child must be added");
+    assert!(!component.contains(&unrelated), "unrelated span must not be added");
+}

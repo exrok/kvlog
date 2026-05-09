@@ -33,6 +33,7 @@ pub enum PredKind {
     HasParentSpan,
     SpanIs,
     ParentSpanIs,
+    SpanInSet,
 }
 
 #[derive(Copy, Clone, Debug)]
