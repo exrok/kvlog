@@ -41,6 +41,7 @@ pub(crate) mod test;
 
 use self::filter::{ForwardQueryWalker, ForwardSegmentWalker, QueryStrategy};
 pub use self::filter::{GeneralFilter, GeneralQuery, ReverseQueryWalker, SpanCache, TimeFilter};
+pub mod aggregate;
 pub mod filter;
 mod table_bucket;
 pub use table_bucket::{
@@ -677,6 +678,14 @@ impl<'a> LogEntry<'a> {
         let index = self.archetype().index_of(key)?;
         unsafe { Some(*self.get_field_unchecked(index)) }
     }
+    /// Decoded value for the field at `key` on this entry, or `None` if the
+    /// archetype doesn't carry that key. Combines [`Self::field_by_key_id`]
+    /// with the value decoder so external callers (e.g. aggregators) don't
+    /// need access to the crate-internal `Field::value`.
+    pub fn value_by_key_id(&self, key: KeyID) -> Option<Value<'_>> {
+        let field = self.field_by_key_id(key)?;
+        Some(unsafe { field.value(self.bucket) })
+    }
     pub fn get_field_unchecked(&self, index: usize) -> &Field {
         let start = unsafe { *self.bucket.offset.as_ptr().add(self.index as usize) };
         let field = self.bucket.field.as_ptr();
@@ -742,6 +751,29 @@ impl<'a> LogEntry<'a> {
             return None;
         }
         Some(unsafe { &*self.bucket.span_data.as_ptr().add(span_index as usize) })
+    }
+    /// LogEntry for the first record of this entry's span in the same
+    /// bucket — i.e. the Start record when the span begins in this
+    /// bucket. The aggregator uses this to read `handler` / `method` /
+    /// `path` off the request's Start when grouping HTTP responses,
+    /// since those fields are emitted on the Start log and not
+    /// duplicated on the End.
+    ///
+    /// Returns `None` when no record for the span has landed in this
+    /// bucket yet (cross-bucket parent stub) or when the matched entry
+    /// has no span at all.
+    pub fn span_first_record(&self) -> Option<LogEntry<'a>> {
+        let span_range = self.span_range()?;
+        let first = span_range.first_mask.load(Ordering::Acquire);
+        if first == SPAN_MASK_NONE {
+            return None;
+        }
+        let record_index = first & 0x7FFF_FFFF;
+        debug_assert!(
+            (record_index as usize) < self.bucket.len.load(Ordering::Acquire),
+            "first_mask points past published bucket length"
+        );
+        Some(LogEntry { bucket: self.bucket, index: record_index })
     }
     pub fn parent_span_id(&self) -> Option<SpanID> {
         if let Some(range) = self.span_range() {
